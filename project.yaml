@@ -5,7 +5,7 @@ upstream:
   policy: documented-vendor-runtime
 source_lock: sources.lock.yaml
 public_delivery:
-  state: pending-automation
+  state: available
   intended_build_script: scripts/build.sh
   intended_run_script: scripts/run.sh
   public_shell_entrypoints: 2

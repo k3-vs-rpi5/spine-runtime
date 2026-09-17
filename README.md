@@ -30,8 +30,12 @@ mode on the X100 cores and `generic/qemu` is for functional validation only.
   input outside Git, with its digest in `sources.lock.yaml`.
 - `spacemit-runtime` is not installed on the board yet, so a first A100 program
   still needs that package or the prebuilt SDK.
-- automation (`src/spine_runtime_project`, `scripts/build.sh`, `scripts/run.sh`)
-  is the next deliverable and is named as pending in `project.yaml`.
+- automation exists: `scripts/build.sh` cross-builds `src/a100_probe.cc` against
+  the SDK and the board's `spine_tcm` header, and `scripts/run.sh` delivers and
+  runs it, keeping the output as evidence.
+- measured on the board: the default backend reports `arch_id 0xa064` (A100),
+  eight granted cores, and 59.9 % AI-cluster busy by `/proc/stat` during a
+  900000-launch window, agreeing with the per-CPU counters.
 
 ## Workspace entry
 

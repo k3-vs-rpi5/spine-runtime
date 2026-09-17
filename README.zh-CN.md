@@ -26,8 +26,10 @@ API 与调度模型是公开的。
 - 文档仓库与 SDK 身份已同步；SDK 作为密封输入留在 Git 之外，其摘要写在
   `sources.lock.yaml` 中。
 - 板上尚未安装 `spacemit-runtime`，因此第一个 A100 程序仍需该包或预编译 SDK。
-- 自动化（`src/spine_runtime_project`、`scripts/build.sh`、`scripts/run.sh`）是下一个
-  交付项，并已在 `project.yaml` 中标注为待完成。
+- 自动化已就位：`scripts/build.sh` 用 SDK 与板卡的 `spine_tcm` 头文件交叉编译
+  `src/a100_probe.cc`，`scripts/run.sh` 负责交付、执行并把输出留作证据。
+- 板上实测：默认后端报告 `arch_id 0xa064`（A100）、获批 8 个核，在 900000 次
+  启动的窗口内 `/proc/stat` 显示智算核忙碌 59.9 %，与 per-CPU 计数器一致。
 
 ## 工作区登记
 
