@@ -1,0 +1,26 @@
+schema_version: 1
+source:
+  name: Spine-Runtime
+  upstream: https://github.com/spacemit-com/spine-runtime.git
+  ref: main
+  commit: b3ff5182de116613b6db72b0f43064554ac3d42d
+  license: MIT
+  checkout: src/spine-runtime
+  identity_note: >-
+    the repository is the documentation and modelling guide; the runnable
+    runtime is the prebuilt SDK package recorded below
+  integrity_command: git -C src/spine-runtime rev-parse HEAD
+sdk:
+  version: 0.6.2
+  url: https://github.com/spacemit-com/spine-runtime/releases/download/0.6.2/spine-runtime.riscv64.0.6.2.tar.gz
+  sha256: fc062cc83a49c98011976fa9620739841c74a619379785172d0f8959df65be47
+  contents: include/spert.hpp, include/spert_engine.hpp, include/spert_abi.h, lib/libspert.so.0.6.2, lib/pkgconfig/spine-runtime.pc
+  checksum_control:
+    include/spert.hpp: c4320387fdb694ce3962f275e6ce626ad133d57d3614837ad5925593d00b5dd9
+    include/spert_abi.h: dfaf14407f0e800a6d3dea4573455ef1c7da7ffb33ce2730963bcf5ac6aa45a0
+    lib/libspert.so.0.6.2: 0db8febc30aa49d6915c174a8f65b076dbbc7f61a4a3a6e18319eb0aa289b7fe
+  native_package: spacemit-runtime 0.6.0+1 riscv64 deb, not installed on the board on 2026-09-17
+backends:
+  spacemit-k3: AI compute cores 8-15, 384 KiB per-core shared buffer
+  spacemit-k3-x100: compatible execution mode on the X100 core set, 4-7
+  generic/qemu: functional validation only

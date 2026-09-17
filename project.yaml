@@ -1,0 +1,21 @@
+schema_version: 2
+project: spine-runtime
+upstream:
+  url: https://github.com/spacemit-com/spine-runtime.git
+  policy: documented-vendor-runtime
+source_lock: sources.lock.yaml
+public_delivery:
+  state: pending-automation
+  intended_build_script: scripts/build.sh
+  intended_run_script: scripts/run.sh
+  public_shell_entrypoints: 2
+  evidence_policy: explicit-absolute-root-outside-project
+clusters:
+  x100: spacemit-k3-x100 backend is the vendor's compatible execution mode
+  a100: spacemit-k3 backend grants the AI compute cores through StreamConfig
+role:
+  why: this is the documented way to compile and submit work for the AI cluster
+  consumers: [llama.cpp, onnxruntime]
+publication:
+  public_claim: false
+  blocker: automation-and-evidence-not-built-yet
