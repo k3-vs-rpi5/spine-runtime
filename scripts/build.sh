@@ -41,4 +41,5 @@ if command -v file >/dev/null 2>&1; then
     file "$STAGE/a100_probe" | cut -c1-90
 fi
 echo "== payload =="
-( cd "$STAGE" && find . -type f -print0 | sort -z | xargs -0 sha256sum | sed 's/^/  /' )
+( cd "$STAGE" && find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS )
+sed 's/^/  /' "$STAGE/SHA256SUMS"
