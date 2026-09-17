@@ -1,6 +1,10 @@
 #!/bin/sh
 # Cross-build the A100 bring-up probe against the published Spine-Runtime SDK.
 #
+# The probe source lives in src/spine_runtime_project/ so this project keeps the
+# same shape as the other projects: pinned upstream in src/<upstream>, our
+# automation in src/<project>_project, and only two public scripts.
+#
 # Binary-only delivery: the board receives the probe and one shared library; it
 # needs no compiler, no SDK and no package manager.
 set -eu
@@ -24,7 +28,7 @@ mkdir -p "$OUT" "$STAGE"
 echo "== build the A100 probe (riscv64) =="
 "$CXX" --sysroot="$TOOLCHAIN/sysroot" -O2 -std=c++17 -Wall \
     -I"$ROOT/src" -I"$SDK/include" -I"$TCM/include" \
-    -o "$OUT/a100_probe" "$ROOT/src/a100_probe.cc" \
+    -o "$OUT/a100_probe" "$ROOT/src/spine_runtime_project/a100_probe.cc" \
     -L"$SDK/lib" -lspert -Wl,-rpath,'$ORIGIN' -pthread
 "$CXX" -print-file-name=libstdc++.so.6 >/dev/null
 cp "$OUT/a100_probe" "$STAGE/a100_probe"
