@@ -30,7 +30,7 @@ mode on the X100 cores and `generic/qemu` is for functional validation only.
   input outside Git, with its digest in `sources.lock.yaml`.
 - `spacemit-runtime` is not installed on the board yet, so a first A100 program
   still needs that package or the prebuilt SDK.
-- automation exists: `scripts/build.sh` cross-builds `src/a100_probe.cc` against
+- automation exists: `scripts/build.sh` cross-builds `src/spine_runtime_project/a100_probe.cc` against
   the SDK and the board's `spine_tcm` header, and `scripts/run.sh` delivers and
   runs it, keeping the output as evidence.
 - measured on the board: the default backend reports `arch_id 0xa064` (A100),
