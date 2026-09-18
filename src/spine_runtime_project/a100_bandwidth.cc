@@ -130,6 +130,64 @@ uint64_t host_checksum_packed(const uint8_t* data, uint64_t bytes, uint32_t pass
     return total;
 }
 
+/* The vendor's decode path reads its weights in calls that average 65,792 bytes
+ * (282,805 MiB over 4,506,936 calls), scattered across a 1.5 GiB weight set
+ * rather than one contiguous run. This variant reproduces exactly that: the
+ * buffer is cut into 65,792-byte tiles, the tiles are visited in a permuted
+ * order, and a working set of the model's size can be requested. If the rate
+ * falls to the ~87 % the decode path shows, the missing 13 % is tile
+ * granularity and working-set size, not the kernel's arithmetic. */
+constexpr uint64_t kTileBytes = 65792;
+
+void read_kernel_tiles(spert::Context* context, const uint8_t* data, uint64_t bytes,
+                       uint32_t passes, uint64_t* out) {
+    const uint32_t tile = context->program_id(0);
+    const uint32_t tiles = context->grid_dim(0);
+    const uint64_t count = bytes / kTileBytes;
+    uint64_t stride = 8191;
+    uint64_t accumulator = 0;
+
+    if (count == 0) {
+        out[tile] = 0;
+        return;
+    }
+    /* A permutation: the multiplier has to be coprime with the tile count, or a
+     * tile would be read twice and another never, which the checksum rejects. */
+    for (;;) {
+        uint64_t a = stride, b = count;
+
+        while (b != 0) {
+            const uint64_t next = a % b;
+
+            a = b;
+            b = next;
+        }
+        if (a == 1)
+            break;
+        stride++;
+    }
+    for (uint32_t pass = 0; pass < passes; ++pass)
+        for (uint64_t index = tile; index < count; index += tiles) {
+            const uint64_t where = (index * stride) % count;
+            const uint64_t* base =
+                reinterpret_cast<const uint64_t*>(data + where * kTileBytes);
+
+            for (uint64_t word = 0; word < kTileBytes / sizeof(uint64_t); ++word)
+                accumulator += base[word];
+        }
+    out[tile] = accumulator;
+}
+
+uint64_t host_checksum_tiles(const uint8_t* data, uint64_t bytes, uint32_t passes) {
+    const uint64_t count = bytes / kTileBytes;
+    uint64_t total = 0;
+
+    for (uint32_t pass = 0; pass < passes; ++pass)
+        for (uint64_t index = 0; index < count * (kTileBytes / 8); ++index)
+            total += reinterpret_cast<const uint64_t*>(data)[index];
+    return total;
+}
+
 /* The same read, one 64-bit word at a time. The byte kernel above issues eight
  * loads per eight bytes, so it measures how fast this core can issue byte
  * loads, not how fast memory can feed it; this variant issues one load per
@@ -220,7 +278,7 @@ int main(int argc, char** argv) {
 
     using kernel_fn = void (*)(spert::Context*, const uint8_t*, uint64_t, uint32_t,
                                uint64_t*);
-    enum class kind { bytes, words, packed };
+    enum class kind { bytes, words, packed, tiled };
     const struct {
         const char* name;
         kernel_fn kernel;
@@ -229,6 +287,7 @@ int main(int argc, char** argv) {
         {"byte", read_kernel, kind::bytes},
         {"word", read_kernel_words, kind::words},
         {"pack4", read_kernel_packed, kind::packed},
+        {"tiled", read_kernel_tiles, kind::tiled},
     };
 
     std::printf("%10s %6s %8s %8s %10s %12s %s\n", "size_MiB", "kernel", "cores",
@@ -281,6 +340,8 @@ int main(int argc, char** argv) {
                         expected += words[index];
             } else if (variant.how == kind::packed) {
                 expected = host_checksum_packed(buffer, bytes, passes);
+            } else if (variant.how == kind::tiled) {
+                expected = host_checksum_tiles(buffer, bytes, passes);
             } else {
                 expected = host_checksum(buffer, bytes, passes);
             }
@@ -292,6 +353,8 @@ int main(int argc, char** argv) {
              * is what the kernels would read: data plus scales. */
             double moved = static_cast<double>(bytes) +
                            (variant.how == kind::packed ? static_cast<double>(scale_bytes) : 0.0);
+            if (variant.how == kind::tiled)
+                moved = static_cast<double>((bytes / kTileBytes) * kTileBytes);
             double mib_per_s = seconds > 0.0 ? moved * passes / kMiB / seconds : 0.0;
             std::printf("%10zu %6s %8u %8u %10.4f %12.1f %s\n", size_mib,
                         variant.name, cores, passes, seconds, mib_per_s,
