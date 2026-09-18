@@ -30,11 +30,18 @@ echo "== build the A100 probe (riscv64) =="
     -I"$ROOT/src" -I"$SDK/include" -I"$TCM/include" \
     -o "$OUT/a100_probe" "$ROOT/src/spine_runtime_project/a100_probe.cc" \
     -L"$SDK/lib" -lspert -Wl,-rpath,'$ORIGIN' -pthread
+"$CXX" --sysroot="$TOOLCHAIN/sysroot" -O2 -std=c++17 -Wall \
+    -I"$ROOT/src" -I"$SDK/include" -I"$TCM/include" \
+    -o "$OUT/a100_bandwidth" "$ROOT/src/spine_runtime_project/a100_bandwidth.cc" \
+    -L"$SDK/lib" -lspert -Wl,-rpath,'$ORIGIN' -pthread
 "$CXX" -print-file-name=libstdc++.so.6 >/dev/null
 cp "$OUT/a100_probe" "$STAGE/a100_probe"
 cp "$SDK/lib/libspert.so.1" "$STAGE/libspert.so.1"
 chmod +x "$STAGE/a100_probe"
 printf "  %-14s %s bytes\n" a100_probe "$(stat -c%s "$STAGE/a100_probe")"
+cp "$OUT/a100_bandwidth" "$STAGE/a100_bandwidth"
+chmod +x "$STAGE/a100_bandwidth"
+printf "  %-14s %s bytes\n" a100_bandwidth "$(stat -c%s "$STAGE/a100_bandwidth")"
 printf "  %-14s %s bytes (SDK %s)\n" libspert.so.1 "$(stat -c%s "$STAGE/libspert.so.1")" \
     "$(cat "$SDK/VERSION_NUMBER" 2>/dev/null || echo unknown)"
 if command -v file >/dev/null 2>&1; then

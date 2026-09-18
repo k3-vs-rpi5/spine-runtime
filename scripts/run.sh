@@ -58,6 +58,8 @@ LOG=$(mktemp)
     remote "spacemit-tcm-smi -i 2>&1 | head -3"
     echo "# probe output:"
     remote "cd $REMOTE && LD_LIBRARY_PATH=$REMOTE ./a100_probe 2>&1"
+    echo "# bandwidth output:"
+    remote "cd $REMOTE && LD_LIBRARY_PATH=$REMOTE ./a100_bandwidth 2>&1"
 } > "$LOG" 2>&1 || true
 cat "$LOG"
 
