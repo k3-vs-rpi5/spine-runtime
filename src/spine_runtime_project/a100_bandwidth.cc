@@ -68,6 +68,68 @@ uint64_t host_checksum(const uint8_t* data, uint64_t bytes, uint32_t passes) {
     return total;
 }
 
+/* The four-bit access pattern the vendor's i8i4 kernels use: 16 bytes of packed
+ * weights plus one 2-byte scale per 32 weights, with all the packed data first
+ * and all the scales in a second region. This is the variant that decides
+ * whether the decode path's 86.8 % of the ceiling is an instruction-mix limit
+ * or a layout limit: it moves the same bytes as a plain stream but has to
+ * unpack every nibble and fetch a scale every 32 weights. */
+void read_kernel_packed(spert::Context* context, const uint8_t* data, uint64_t bytes,
+                        uint32_t passes, uint64_t* out) {
+    const uint32_t tile = context->program_id(0);
+    const uint32_t tiles = context->grid_dim(0);
+    const uint64_t per_tile = bytes / tiles;            /* packed data bytes */
+    const uint64_t blocks = per_tile / 16;              /* 16 data bytes per 32 weights */
+    const uint8_t* base = data + static_cast<uint64_t>(tile) * per_tile;
+    const uint8_t* scales = data + bytes + static_cast<uint64_t>(tile) * blocks * 2;
+    uint64_t accumulator = 0;
+
+    for (uint32_t pass = 0; pass < passes; ++pass)
+        for (uint64_t block = 0; block < blocks; ++block) {
+            const uint8_t* packed = base + block * 16;
+            uint64_t low = 0, high = 0;
+            uint16_t scale = 0;
+
+            __builtin_memcpy(&low, packed, sizeof(low));
+            __builtin_memcpy(&high, packed + 8, sizeof(high));
+            __builtin_memcpy(&scale, scales + block * 2, sizeof(scale));
+            /* Every byte of both words: a 64-bit word holds sixteen nibbles, and
+             * an earlier version of this loop walked four shift values and
+             * summed only a quarter of the weights while still reading every
+             * byte. The host checksum caught it, which is exactly why a kernel
+             * is checked against a reference before its rate is quoted. */
+            for (unsigned shift = 0; shift < 64; shift += 8) {
+                const uint8_t low_byte = (uint8_t)(low >> shift);
+                const uint8_t high_byte = (uint8_t)(high >> shift);
+
+                accumulator += (low_byte & 0x0fu) + (low_byte >> 4);
+                accumulator += (high_byte & 0x0fu) + (high_byte >> 4);
+            }
+            accumulator += scale;
+        }
+    out[tile] = accumulator;
+}
+
+uint64_t host_checksum_packed(const uint8_t* data, uint64_t bytes, uint32_t passes) {
+    const uint64_t blocks = bytes / 16;
+    const uint8_t* scales = data + bytes;
+    uint64_t total = 0;
+
+    for (uint32_t pass = 0; pass < passes; ++pass)
+        for (uint64_t block = 0; block < blocks; ++block) {
+            uint16_t scale = 0;
+
+            for (uint64_t index = 0; index < 16; ++index) {
+                const uint8_t byte = data[block * 16 + index];
+
+                total += (byte & 0x0fu) + (byte >> 4);
+            }
+            __builtin_memcpy(&scale, scales + block * 2, sizeof(scale));
+            total += scale;
+        }
+    return total;
+}
+
 /* The same read, one 64-bit word at a time. The byte kernel above issues eight
  * loads per eight bytes, so it measures how fast this core can issue byte
  * loads, not how fast memory can feed it; this variant issues one load per
@@ -158,21 +220,24 @@ int main(int argc, char** argv) {
 
     using kernel_fn = void (*)(spert::Context*, const uint8_t*, uint64_t, uint32_t,
                                uint64_t*);
+    enum class kind { bytes, words, packed };
     const struct {
         const char* name;
         kernel_fn kernel;
-        bool words;
+        kind how;
     } variants[] = {
-        {"byte", read_kernel, false},
-        {"word", read_kernel_words, true},
+        {"byte", read_kernel, kind::bytes},
+        {"word", read_kernel_words, kind::words},
+        {"pack4", read_kernel_packed, kind::packed},
     };
 
     std::printf("%10s %6s %8s %8s %10s %12s %s\n", "size_MiB", "kernel", "cores",
                 "passes", "seconds", "MiB_per_s", "checksum");
     for (size_t size_mib : sizes) {
         size_t bytes = size_mib * kMiB;
+        size_t scale_bytes = bytes / 8;          /* 2 bytes per 16 data bytes */
         bool huge = false;
-        uint8_t* buffer = allocate(bytes, &huge);
+        uint8_t* buffer = allocate(bytes + scale_bytes, &huge);
 
         if (buffer == nullptr) {
             std::printf("%10zu %8s %8s %10s %12s %s\n", size_mib, "-", "-", "-", "-",
@@ -182,6 +247,8 @@ int main(int argc, char** argv) {
         /* A pattern the compiler cannot fold into a constant. */
         for (size_t index = 0; index < bytes; ++index)
             buffer[index] = static_cast<uint8_t>((index * 31u + 7u) & 0xffu);
+        for (size_t index = 0; index < scale_bytes; ++index)
+            buffer[bytes + index] = static_cast<uint8_t>((index * 13u + 5u) & 0xffu);
 
         for (const auto& variant : variants) {
             uint32_t passes = kMinPasses;
@@ -205,13 +272,15 @@ int main(int argc, char** argv) {
 
             uint64_t expected = 0;
 
-            if (variant.words) {
+            if (variant.how == kind::words) {
                 const uint64_t* words = reinterpret_cast<const uint64_t*>(buffer);
                 uint64_t count = bytes / sizeof(uint64_t);
 
                 for (uint32_t pass = 0; pass < passes; ++pass)
                     for (uint64_t index = 0; index < count; ++index)
                         expected += words[index];
+            } else if (variant.how == kind::packed) {
+                expected = host_checksum_packed(buffer, bytes, passes);
             } else {
                 expected = host_checksum(buffer, bytes, passes);
             }
@@ -219,17 +288,20 @@ int main(int argc, char** argv) {
 
             for (uint64_t value : out)
                 got += value;
-            double mib_per_s = seconds > 0.0
-                                   ? static_cast<double>(bytes) * passes / kMiB / seconds
-                                   : 0.0;
+            /* The packed variant moves its scale region as well, so its traffic
+             * is what the kernels would read: data plus scales. */
+            double moved = static_cast<double>(bytes) +
+                           (variant.how == kind::packed ? static_cast<double>(scale_bytes) : 0.0);
+            double mib_per_s = seconds > 0.0 ? moved * passes / kMiB / seconds : 0.0;
             std::printf("%10zu %6s %8u %8u %10.4f %12.1f %s\n", size_mib,
                         variant.name, cores, passes, seconds, mib_per_s,
                         got == expected ? "ok" : "MISMATCH");
-            std::printf("RESULT size_mib=%zu kernel=%s cores=%u passes=%u seconds=%.4f mib_per_s=%.1f hugepages=%d checksum=%s\n",
+            std::printf("RESULT size_mib=%zu kernel=%s cores=%u passes=%u seconds=%.4f mib_per_s=%.1f moved_mib=%.1f hugepages=%d checksum=%s\n",
                         size_mib, variant.name, cores, passes, seconds, mib_per_s,
-                        huge ? 1 : 0, got == expected ? "ok" : "mismatch");
+                        moved / kMiB, huge ? 1 : 0,
+                        got == expected ? "ok" : "mismatch");
         }
-        munmap(buffer, bytes);
+        munmap(buffer, bytes + scale_bytes);
     }
     return 0;
 }
