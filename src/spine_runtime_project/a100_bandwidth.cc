@@ -238,6 +238,46 @@ void read_kernel_decode_shape(spert::Context* context, const uint8_t* data, uint
  * blocks per unit, one `vsetvli` each, 15.0 GiB/s); this one exists to find out
  * whether the gap to the flat walk (25.4-26.0 GiB/s) is the unit size and the
  * load shape or only the hand-written kernel's structure. */
+/* The read-size mix decode actually issues. The trace showed four unit sizes -
+ * 38,912 / 69,632 / 116,736 / 208,896 bytes - in the proportion 12 : 2 : 1 : 1,
+ * because tensors differ in K. Every other model here reads one fixed size, so
+ * this one exists to answer the last open question about decode's residual gap:
+ * is it the *mix* rather than the size or the order? The pattern repeats over a
+ * 931,840-byte super-unit so the host can still sum whole units. */
+void read_kernel_size_mix(spert::Context* context, const uint8_t* data, uint64_t bytes,
+                          uint32_t passes, uint64_t* out) {
+    const uint32_t tile = context->program_id(0);
+    const uint32_t tiles = context->grid_dim(0);
+    static constexpr uint64_t kPattern[16] = {
+        38912, 38912, 38912, 38912, 38912, 38912, 38912, 38912,
+        38912, 38912, 38912, 38912, 69632, 69632, 116736, 208896,
+    };
+    constexpr uint64_t kSuper = 931840; /* sum of the pattern */
+    const uint64_t supers = bytes / kSuper;
+    const uint64_t per_core = supers / tiles;
+    uint64_t accumulator = 0;
+
+    if (per_core == 0) {
+        out[tile] = 0;
+        return;
+    }
+    for (uint32_t pass = 0; pass < passes; ++pass)
+        for (uint64_t s = (uint64_t) tile * per_core; s < (uint64_t) (tile + 1) * per_core; ++s) {
+            const uint8_t* base = data + s * kSuper;
+            uint64_t offset = 0;
+
+            for (int unit = 0; unit < 16; ++unit) {
+                const uint64_t* words = reinterpret_cast<const uint64_t*>(base + offset);
+                const uint64_t count = kPattern[unit] / sizeof(uint64_t);
+
+                for (uint64_t word = 0; word < count; ++word)
+                    accumulator += words[word];
+                offset += kPattern[unit];
+            }
+        }
+    out[tile] = accumulator;
+}
+
 /* The decode's unit size, but with each core owning one contiguous range instead of
  * alternating with its pair: this is the shape the blocked-columns candidate wants,
  * so its rate is the ceiling that candidate is aiming at. */
@@ -1590,6 +1630,7 @@ int main(int argc, char** argv) {
         {"t64k", read_kernel_tile_size<65536>, kind::tilesize},
         {"t38912blk", read_kernel_tile_size_blocked<38912>, kind::tilesize},
         {"t65536blk", read_kernel_tile_size_blocked<65536>, kind::tilesize},
+        {"sizemix", read_kernel_size_mix, kind::tilesize},
         {"d608vec", read_kernel_608_vector, kind::d608},
         {"d608int", read_kernel_608_intrinsic, kind::d608},
         /* the same packed read, serving 1, 4 and 8 rows from one pass over it */
@@ -1675,6 +1716,8 @@ int main(int argc, char** argv) {
                     tile_bytes = 38912;
                 else if (std::strcmp(variant.name, "t65536blk") == 0)
                     tile_bytes = 65536;
+                else if (std::strcmp(variant.name, "sizemix") == 0)
+                    tile_bytes = 931840;
                 expected = host_checksum_tile_size(buffer, bytes, passes, tile_bytes);
             } else {
                 expected = host_checksum(buffer, bytes, passes);
@@ -1709,6 +1752,8 @@ int main(int argc, char** argv) {
                     tile_bytes = 38912;
                 else if (std::strcmp(variant.name, "t65536blk") == 0)
                     tile_bytes = 65536;
+                else if (std::strcmp(variant.name, "sizemix") == 0)
+                    tile_bytes = 931840;
                 moved = static_cast<double>((bytes / tile_bytes) * tile_bytes);
             }
             double mib_per_s = seconds > 0.0 ? moved * passes / kMiB / seconds : 0.0;
