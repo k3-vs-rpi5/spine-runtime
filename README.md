@@ -154,6 +154,33 @@ executes as ordinary userspace code on the Linux cluster. Writing our own
 multi-row kernel is open again, with a packing routine to write and a self-test to
 pass first.
 
+## What such a kernel measures
+
+The demo's shape, with its B operand packed once and streamed from a large buffer
+while the accumulator stays in a vector register, on **one** X100 core pinned with
+`taskset -c 0`:
+
+| weight buffer | checksum | rate |
+|---|---|---|
+| 256 MiB | ok | 8,029 MiB/s |
+| 1 GiB | ok | 7,832 MiB/s |
+
+Against the other streamers: our scalar unpack reads 2.7 GiB/s and our RVV unpack
+2.5 GiB/s on all eight AI cores, the vendor's one-row kernel 9.0 GiB/s per kernel
+on the AI cluster. So one X100 core is within 15 % of the vendor's per-kernel
+rate, eight of them would ask for about 61 GiB/s against a 24.6 GiB/s roof, the
+MAC unit already consumes a four-row activation tile per weight tile (the
+structure the vendor loses 25 % to 30 % on when it regroups a batch), and all of
+it is ordinary threads on cpu0-7 where `taskset`, per-process accounting, perf and
+the eBPF collectors apply.
+
+Also recorded: `csrr vlenb` reads 32 bytes on the X100 cores, so **VLEN=256**,
+while the AI cluster's backend reports 128 - the two clusters are not
+interchangeable, which is why the demo (written for VLEN=256) passes here.
+
+Not yet done: a multi-core version, a decode-shaped K, and any end-to-end token
+rate.
+
 ## Workspace entry
 
 ```xml
