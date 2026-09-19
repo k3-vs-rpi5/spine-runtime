@@ -388,6 +388,33 @@ re-implementation project whose payoff is bounded by the 25 % to 30 % the vendor
 four-row chunking loses in the first place. Recorded as measured, with the choice
 left open rather than taken.
 
+### A finer look corrects that: the decode kernel runs instruction families we cannot assemble
+
+The paragraph above said the vendor uses "ordinary RVV". Counting the instructions
+objdump could not decode - it renders them `.insn 4, 0x...`, which a mnemonic
+search does not see - corrects it. The library holds 494 such instructions, and
+their `funct7` fields split into families:
+
+| funct7 | library count | our toolchain |
+|---|---|---|
+| 0x71 | 176 | assembles: this is `smt.vmadot`, the documented family |
+| 0x33 | 200 | no mnemonic, no decoder |
+| 0x66 | 32 | no mnemonic, no decoder |
+| 0x6B | 20 | no mnemonic, no decoder |
+| 0x21 / 0x61 / 0x6A / 0x79 / 0x7A / 0x7B | 14 / 8 / 12 / 16 / 8 / 8 | no mnemonic, no decoder |
+
+And the decode leaf itself, `ime2::gemm_kernel_i8i4_m1`, has **zero** instructions
+from the 0x71 family and 40 from the other five (0x66 x12, 0x33 x10, 0x6B x8,
+0x21 x6, 0x6A x4). So the kernel that produces 9.0 GiB/s runs instructions this
+workspace's assembler cannot emit at all, while everything written here - `pack4`,
+`pack4v`, `rvvgemv`, the vmadot probes - is from the family it does not use.
+
+That is why the 4.5x gap is not a tuning problem to grind out: the encodings are a
+prerequisite, as the IME programming model was before the specification appeared -
+except this time the specification that exists documents a family the decode kernel
+does not use. Recorded, with the vendor-kernel facts and the np=4 / lockstep
+guidance unchanged.
+
 ## Workspace entry
 
 ```xml
