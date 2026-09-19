@@ -590,15 +590,46 @@ same shape first: `a100_probe`'s `out[tile]` convention and the layout masks do,
 and the `--sfqmac` control's per-core line is re-opened as unverified - its
 conclusion, that the family never syncs, is untouched.
 
-What remains before a rate can be quoted is the kernel rather than the layout:
-nibble packing through `smt.vnpack4.vv`, the `imm3` scale groups, and
-`smt.vpack.vv` for the accumulator interleave, measured against the vendor's
-9,000 MiB/s and our RVV best of 2,012-2,730 MiB/s.
+### The vendor's own shape streams 22.7 GiB/s, against the vendor kernel's 9.0
 
-One harness defect measured here is unrelated to the instruction and pre-dates
-this change: `a100_bandwidth 8` (8 MiB) segfaults before printing anything, on
-this revision and on the one before it, while 64 MiB and above complete - so the
-sizes quoted in this file are the larger ones.
+`a100_bandwidth` now carries that shape as a variant: one `smt.vmadotsu.hp` per
+128-byte weight register plus the 16-byte load of the eight FP16 column scales -
+144 bytes of traffic per instruction, the same accounting the vendor's `i8i4_m1`
+entry point is charged for its 9.0 GiB/s. The loads are checked exactly (every
+weight register XORed into a 16-lane accumulator, reproduced on the host), and the
+instruction's own arithmetic is checked by `--smthp` above.
+
+| kernel | 64 MiB | 256 MiB |
+|---|---|---|
+| `word` (plain stream, the roof) | 25,176 | 24,623 |
+| `tiled` (the decode path's own walk) | 22,710 | 23,475 |
+| `smthp` (vendor shape) | **22,679** | **22,670** |
+| `smthpnd` (same loop, no matrix instruction) | 22,678 | 21,525 |
+| `pack4` (scalar unpack) | 2,957 | 2,669 |
+| `gemvR1` (one read serving one row) | 2,714 | 2,570 |
+| `rvvgemv` (our RVV gemv) | 2,094 | 2,008 |
+| vendor `i8i4_m1` (kernel probe, earlier round) | 9,000 | - |
+
+All MiB/s, all with the same data-plus-scales accounting. Three things follow.
+The instruction is free at this granularity - `smthp` and `smthpnd` are within
+noise and both sit at the `tiled` walk. An own kernel in the vendor's own shape
+streams 2.5x the vendor's one-row kernel and 8-11x our best RVV gemv. And
+single-sequence decode is already at this roof in aggregate: 1,465-1,475 MiB per
+token at 14.0-14.4 t/s is 21.1 GiB/s against the 22.7 measured here, so the
+vendor's 9.0 GiB/s is a per-kernel figure, not the system's ceiling.
+
+The case that is *not* at the roof is multi-row: at np=4 the run moves 402 MiB per
+token in aggregate at 66.9 % of the bus, on the vendor's four-row kernel, measured
+earlier at 5.8 GiB/s. 402 MiB per token against this stream is 56 tokens/s
+aggregate against the 41.0 measured today, which is the next experiment.
+
+One caution about the harness, recorded rather than hidden: the submitting process
+dies at exit flakily, after all work is done and after every checksum has passed -
+on this revision and on the one before the matrix kernels were added, with and
+without the matrix instruction, and `stdbuf -o0` does not change it. A run is
+therefore accepted on: every `RESULT` line present, every `checksum=ok`, and
+`a100_probe` healthy either side. The process exit status is not a usable success
+signal here until that defect is found.
 
 ## Workspace entry
 

@@ -452,6 +452,138 @@ void probe_smthp_control_kernel(spert::Context* context, const uint8_t* data,
     out[tile] = 0x3000ull + tile;
 }
 
+/* The vendor's own shape: one `smt.vmadotsu.hp` per 128-byte weight register.
+ *
+ * Per instruction the tile is 8 rows x 32 weights x 8 columns of Int4, which is
+ * exactly one register of packed weights, plus the eight FP16 column scales in
+ * `v0`. That is 144 bytes of traffic per instruction - the same arithmetic the
+ * vendor's `i8i4_m1` kernel does - and this kernel streams exactly that under
+ * the harness's usual rate accounting.
+ *
+ * What is verified here is the data flow, exactly: every weight register is
+ * loaded once, XORed into a 16-lane accumulator (order-independent, so the host
+ * can reproduce it byte for byte), and handed to the matrix instruction. The
+ * arithmetic of the instruction itself is verified separately by `--smthp`. The
+ * FP16 accumulator is cleared each iteration on purpose - the block-scaled
+ * destination saturates after a couple of thousand accumulations, and a rate is
+ * not allowed to depend on how a saturating sum rounds.
+ */
+void read_kernel_smthp(spert::Context* context, const uint8_t* data, uint64_t bytes,
+                       uint32_t passes, uint64_t* out) {
+    const uint32_t tile = context->program_id(0);
+    const uint32_t tiles = context->grid_dim(0);
+    const uint64_t per_tile = bytes / tiles;
+    const uint64_t blocks = per_tile / 128;
+    const uint8_t* weights = data + static_cast<uint64_t>(tile) * per_tile;
+    const uint8_t* scales = data + bytes + static_cast<uint64_t>(tile) * blocks * 16;
+
+    /* The activation tile is one register, loaded once: this is a decode shape,
+     * where the activations are reused across a great many weight blocks. */
+    __asm__ volatile(
+        "vsetvli t0, zero, e8, m1     \n\t"
+        "vle8.v  v16, (%[ACT])        \n\t"
+        : : [ACT] "r"(weights) : "cc", "t0", "v16", "memory");
+    for (uint32_t pass = 0; pass < passes; ++pass) {
+        const uint8_t* w = weights;
+        const uint8_t* s = scales;
+
+        __asm__ volatile(
+            "vsetvli t0, zero, e64, m1    \n\t"
+            "vxor.vv v20, v20, v20        \n\t"
+            : : : "cc", "t0", "v20");
+        for (uint64_t block = 0; block < blocks; ++block, w += 128, s += 16) {
+            __asm__ volatile(
+                "vsetvli t0, zero, e64, m1          \n\t"
+                "vle64.v v18, (%[W])                \n\t"
+                "vxor.vv v20, v20, v18              \n\t"
+                "vsetivli t0, 8, e16, m1            \n\t"
+                "vle16.v v0, (%[S])                 \n\t"
+                "vsetvli t0, zero, e16, m1, tu, mu  \n\t"
+                "smt.vmadotsu.hp v24,v16,v18,v0,0,i4 \n\t"
+                "vxor.vv v24, v24, v24              \n\t"
+                : : [W] "r"(w), [S] "r"(s)
+                : "cc", "t0", "v0", "v16", "v18", "v20", "v24", "memory");
+        }
+        uint64_t value = 0;
+
+        __asm__ volatile(
+            "vsetvli t0, zero, e64, m1    \n\t"
+            "vmv.v.i v0, 0                \n\t"
+            /* A separate destination rather than the natural `vredsum.vs v0, v20,
+             * v0`: the overlapping form was the first suspect for the process
+             * dying at exit, and moving the destination did not change it. Kept
+             * because it does not rely on read-before-write overlap. */
+            "vredsum.vs v2, v20, v0       \n\t"
+            "vmv.x.s %[VAL], v2           \n\t"
+            : [VAL] "=r"(value)
+            : : "cc", "t0", "v0", "v2", "v20", "memory");
+        out[tile] += value;
+    }
+}
+
+/* The host side of the same statement: XOR every 128-byte block into 16 lanes,
+ * sum the lanes, once per pass. The per-tile split cannot change it, because XOR
+ * over a partition of the same set is the same XOR. */
+/* The control for the rate above: identical loads, identical checksum, no matrix
+ * instruction. It separates "the stream runs at this rate" from "the stream plus
+ * one matrix instruction per register runs at this rate". */
+void read_kernel_smthp_control(spert::Context* context, const uint8_t* data,
+                               uint64_t bytes, uint32_t passes, uint64_t* out) {
+    const uint32_t tile = context->program_id(0);
+    const uint32_t tiles = context->grid_dim(0);
+    const uint64_t per_tile = bytes / tiles;
+    const uint64_t blocks = per_tile / 128;
+    const uint8_t* weights = data + static_cast<uint64_t>(tile) * per_tile;
+    const uint8_t* scales = data + bytes + static_cast<uint64_t>(tile) * blocks * 16;
+
+    for (uint32_t pass = 0; pass < passes; ++pass) {
+        const uint8_t* w = weights;
+        const uint8_t* s = scales;
+
+        __asm__ volatile(
+            "vsetvli t0, zero, e64, m1    \n\t"
+            "vxor.vv v20, v20, v20        \n\t"
+            : : : "cc", "t0", "v20");
+        for (uint64_t block = 0; block < blocks; ++block, w += 128, s += 16) {
+            __asm__ volatile(
+                "vsetvli t0, zero, e64, m1          \n\t"
+                "vle64.v v18, (%[W])                \n\t"
+                "vxor.vv v20, v20, v18              \n\t"
+                "vsetivli t0, 8, e16, m1            \n\t"
+                "vle16.v v0, (%[S])                 \n\t"
+                : : [W] "r"(w), [S] "r"(s)
+                : "cc", "t0", "v0", "v18", "v20", "memory");
+        }
+        uint64_t value = 0;
+
+        __asm__ volatile(
+            "vsetvli t0, zero, e64, m1    \n\t"
+            "vmv.v.i v0, 0                \n\t"
+            "vredsum.vs v2, v20, v0       \n\t"
+            "vmv.x.s %[VAL], v2           \n\t"
+            : [VAL] "=r"(value)
+            : : "cc", "t0", "v0", "v2", "v20", "memory");
+        out[tile] += value;
+    }
+}
+
+uint64_t host_checksum_smthp(const uint8_t* data, uint64_t bytes, uint32_t passes) {
+    uint64_t lanes[16] = {0};
+    const uint64_t blocks = bytes / 128;
+
+    for (uint64_t block = 0; block < blocks; ++block) {
+        const uint64_t* words = reinterpret_cast<const uint64_t*>(data + block * 128);
+
+        for (int lane = 0; lane < 16; ++lane)
+            lanes[lane] ^= words[lane];
+    }
+    uint64_t total = 0;
+
+    for (int lane = 0; lane < 16; ++lane)
+        total += lanes[lane];
+    return total * passes;
+}
+
 /* An RVV gemv in the shape the vendor's own kernels use.
  *
  * Disassembling `spacemit_kernels::ime2::gemm_kernel_i8i4_m1` in the board's
@@ -1058,7 +1190,8 @@ int main(int argc, char** argv) {
 
     using kernel_fn = void (*)(spert::Context*, const uint8_t*, uint64_t, uint32_t,
                                uint64_t*);
-    enum class kind { bytes, words, packed, packed_scaled, tiled, gemv1, gemv4, gemv8 };
+    enum class kind { bytes, words, packed, packed_scaled, tiled, gemv1, gemv4, gemv8,
+                      smthp };
     const struct {
         const char* name;
         kernel_fn kernel;
@@ -1070,6 +1203,8 @@ int main(int argc, char** argv) {
 #ifdef HAVE_RVV
         {"pack4v", read_kernel_packed_vector, kind::packed},
         {"rvvgemv", read_kernel_rvv_gemv, kind::packed_scaled},
+        {"smthp", read_kernel_smthp, kind::smthp},
+        {"smthpnd", read_kernel_smthp_control, kind::smthp},
 #endif
         {"tiled", read_kernel_tiles, kind::tiled},
         /* the same packed read, serving 1, 4 and 8 rows from one pass over it */
@@ -1138,6 +1273,8 @@ int main(int argc, char** argv) {
                 expected = host_checksum_gemv<4>(buffer, bytes, passes);
             } else if (variant.how == kind::gemv8) {
                 expected = host_checksum_gemv<8>(buffer, bytes, passes);
+            } else if (variant.how == kind::smthp) {
+                expected = host_checksum_smthp(buffer, bytes, passes);
             } else {
                 expected = host_checksum(buffer, bytes, passes);
             }
@@ -1150,7 +1287,8 @@ int main(int argc, char** argv) {
             double moved = static_cast<double>(bytes) +
                            (variant.how == kind::packed || variant.how == kind::packed_scaled ||
                             variant.how == kind::gemv1 ||
-                            variant.how == kind::gemv4 || variant.how == kind::gemv8
+                            variant.how == kind::gemv4 || variant.how == kind::gemv8 ||
+                            variant.how == kind::smthp
                                 ? static_cast<double>(scale_bytes)
                                 : 0.0);
             if (variant.how == kind::tiled)
