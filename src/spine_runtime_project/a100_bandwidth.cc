@@ -291,6 +291,78 @@ uint64_t host_checksum_gemv(const uint8_t* data, uint64_t bytes, uint32_t passes
 #ifdef HAVE_RVV
 static uint8_t* allocate(size_t bytes, bool* huge);
 
+/* Same probe with a different operand configuration, to see whether "only two
+ * bytes of A participate" is a property of one vsetvli setting or of the cluster.
+ * SEW=4 cannot be asked for at all: this toolchain's assembler rejects
+ * `vsetvli t0, zero, e4, m1` with "illegal operands", so the smallest MAC unit the
+ * specification's table lists is reachable only through raw instruction encoding
+ * and is not covered here. */
+void probe_kernel_e16(spert::Context* context, const uint8_t* data, uint64_t bytes,
+                      uint32_t passes, uint64_t* out) {
+    const uint32_t tile = context->program_id(0);
+
+    (void)bytes;
+    (void)passes;
+    for (int step = 0; step < 2; ++step) {
+        const uint32_t tile_case = tile * 2 + (uint32_t)step;
+        const uint8_t* slice = data + (uint64_t)tile_case * 32;
+        int32_t* acc = reinterpret_cast<int32_t*>(out + (uint64_t)tile_case * 16);
+
+        for (int index = 0; index < 8; ++index)
+            acc[index] = 0;
+        __asm__ volatile(
+            "vsetvli t0, zero, e32, m2   \n\t"
+            "vle32.v v28, (%[ACC])       \n\t"
+            "vsetvli t0, zero, e16, m1   \n\t"
+            "vle16.v v0, (%[A])          \n\t"
+            "vle16.v v1, (%[B])          \n\t"
+            "vmadot  v28, v0, v1         \n\t"
+            "vsetvli t0, zero, e32, m2   \n\t"
+            "vse32.v v28, (%[ACC])       \n\t"
+            : : [A] "r"(slice), [B] "r"(slice + 16), [ACC] "r"(acc)
+            : "cc", "t0", "v0", "v1", "v28", "memory");
+        uint64_t mask = 0;
+
+        for (int index = 0; index < 8; ++index)
+            if (acc[index] != 0)
+                mask |= (uint64_t)1 << index;
+        out[tile_case * 16 + 8] = mask | 0x1000000000ull;
+    }
+}
+
+void probe_kernel_av8(spert::Context* context, const uint8_t* data, uint64_t bytes,
+                      uint32_t passes, uint64_t* out) {
+    const uint32_t tile = context->program_id(0);
+
+    (void)bytes;
+    (void)passes;
+    for (int step = 0; step < 2; ++step) {
+        const uint32_t tile_case = tile * 2 + (uint32_t)step;
+        const uint8_t* slice = data + (uint64_t)tile_case * 32;
+        int32_t* acc = reinterpret_cast<int32_t*>(out + (uint64_t)tile_case * 16);
+
+        for (int index = 0; index < 8; ++index)
+            acc[index] = 0;
+        __asm__ volatile(
+            "vsetvli t0, zero, e32, m2   \n\t"
+            "vle32.v v28, (%[ACC])       \n\t"
+            "vsetivli t0, 8, e8, m1      \n\t"
+            "vle8.v  v0, (%[A])          \n\t"
+            "vle8.v  v1, (%[B])          \n\t"
+            "vmadot  v28, v0, v1         \n\t"
+            "vsetvli t0, zero, e32, m2   \n\t"
+            "vse32.v v28, (%[ACC])       \n\t"
+            : : [A] "r"(slice), [B] "r"(slice + 16), [ACC] "r"(acc)
+            : "cc", "t0", "v0", "v1", "v28", "memory");
+        uint64_t mask = 0;
+
+        for (int index = 0; index < 8; ++index)
+            if (acc[index] != 0)
+                mask |= (uint64_t)1 << index;
+        out[tile_case * 16 + 8] = mask | 0x1000000000ull;
+    }
+}
+
 /* Layout probe for vmadot on this cluster.
  *
  * The IME specification pins the operand *shapes* down (Copies*(M,K) in vs1,
@@ -412,6 +484,45 @@ static int ime_layout_probe(spert::Stream& stream, const uint32_t cores)
                      acc[0], acc[1], acc[2], acc[3], acc[4], acc[5], acc[6], acc[7],
                      acc2[0], acc2[1], acc2[2], acc2[3], acc2[4], acc2[5], acc2[6],
                      acc2[7], (unsigned long long)mask);
+    }
+
+    /* The A sweep only, under the configurations the assembler accepts: A has a
+     * single 1 at p and B is all ones, so a live p means that byte of A reaches
+     * the MAC. */
+    {
+        const struct {
+            const char* name;
+            void (*kernel)(spert::Context*, const uint8_t*, uint64_t, uint32_t, uint64_t*);
+        } configs[] = {
+            {"e8  (this probe)", probe_kernel},
+            {"e16", probe_kernel_e16},
+            {"e8 avl=8", probe_kernel_av8},
+        };
+
+        for (int index = 0; index < 16; ++index) {
+            uint8_t* slice = buffer + index * 32;
+
+            std::memset(slice, 0, 32);
+            slice[index % 16] = 1;
+            for (int other = 16; other < 32; ++other)
+                slice[other] = 1;
+        }
+        for (const auto& config : configs) {
+            std::memset(out_bytes, 0, 256 * 16 * sizeof(uint64_t));
+            auto attempt = stream.launch(spert::Grid(cores), config.kernel, buffer,
+                                         (uint64_t)512, 1u, out);
+
+            if (!attempt.valid()) {
+                std::fprintf(stderr, "config %-16s launch refused\n", config.name);
+                continue;
+            }
+            attempt.sync();
+            std::fprintf(stderr, "config %-16s live A positions:", config.name);
+            for (int index = 0; index < 16; ++index)
+                if (out[index * 16 + 8] & 0xff)
+                    std::fprintf(stderr, " %d", index);
+            std::fprintf(stderr, "\n");
+        }
     }
     return 0;
 }

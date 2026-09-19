@@ -25,6 +25,11 @@ STAGE=${SPERT_STAGE:-$WORKSPACE/.local/spine-runtime/stage}
     echo "missing the board's spine_tcm header copy: $TCM" >&2; exit 1; }
 mkdir -p "$OUT" "$STAGE"
 
+# A failed compile must not leave the previous binary in place: the stage is what
+# gets pushed to the board, and a stale artefact that looks current is worse than
+# a missing one. Both binaries are removed up front so a failure is a failure.
+rm -f "$OUT/a100_probe" "$OUT/a100_bandwidth" "$STAGE/a100_probe" "$STAGE/a100_bandwidth"
+
 echo "== build the A100 probe (riscv64) =="
 # The kernels these binaries submit run on the AI cluster, so they are compiled
 # for it: without an A100 ISA the toolchain emits plain rv64gc code and the

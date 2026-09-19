@@ -285,6 +285,28 @@ say whether the small operand consumption is a property of this configuration or
 of the cluster. Recorded as the state of the A100 own-kernel route: a measured
 obstacle, a few configuration runs away from being settled.
 
+### The obstacle is withdrawn: every byte of A participates
+
+The configuration runs have been made, and they refute the paragraph above. With
+a single 1 in A at p and **B all ones** - a different question from the pairing
+sweep - both full-vector configurations show **all sixteen A positions live**
+(`e8`: 0-15; `e16`: 0-15), and the AVL=8 row shows the window shrinking as a
+smaller `vl` should (0-7 minus 6). So the earlier sparsity was a property of the
+pairing, not of operand consumption: with a single 1 in each operand, only the A
+positions whose partner lands inside the 16-byte B window can answer.
+
+Two toolchain facts are recorded with it. The specification's SEW=4 configuration
+cannot be requested through this assembler at all (`vsetvli ..., e4, m1` is
+"illegal operands", and the immediate-AVL form is `vsetivli`, not `vsetvli`), so
+the smallest MAC unit would need raw instruction encoding. And a failed compile
+used to leave the previous binary in the stage - which is how a sweep once ran
+with no output and looked like a silent result; `build.sh` now removes both
+binaries before compiling.
+
+What remains for the A100 own-kernel route is a pairing solve with a B window wide
+enough to hold every partner of every A position, then the packing routine, then
+the rate at R=1, 2 and 4 against the vendor's 9.0 and 5.8 GiB/s.
+
 ## Workspace entry
 
 ```xml
