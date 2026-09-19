@@ -232,6 +232,130 @@ void read_kernel_decode_shape(spert::Context* context, const uint8_t* data, uint
     out[tile] = accumulator;
 }
 
+/* The decode format's own read granularity, done the way the decode kernel does it:
+ * one 512-byte multi-register load, one 64-byte load and one 32-byte load per
+ * 608-byte k-block, all vector, with the units visited in the backend's ascending
+ * interleaved order. The scalar version of this walk measures its own loop overhead
+ * (6.4 GiB/s); this one measures the memory system. */
+void read_kernel_608_vector(spert::Context* context, const uint8_t* data, uint64_t bytes,
+                            uint32_t passes, uint64_t* out) {
+    const uint32_t tile = context->program_id(0);
+    const uint32_t tiles = context->grid_dim(0);
+    constexpr uint64_t kUnit = 608;
+    const uint64_t count = bytes / kUnit;
+    uint64_t accumulator = 0;
+
+    if (count == 0) {
+        out[tile] = 0;
+        return;
+    }
+    /* The lane accumulators must start at zero, or the first pass adds whatever the
+     * registers happened to hold - which is how this variant first reported a
+     * checksum mismatch. */
+    __asm__ volatile(
+        "vsetvli t0, zero, e64, m1    \n\t"
+        "vxor.vv v20, v20, v20        \n\t"
+        "vxor.vv v21, v21, v21        \n\t"
+        "vxor.vv v22, v22, v22        \n\t"
+        "vxor.vv v23, v23, v23        \n\t"
+        : : : "cc", "t0", "v20", "v21", "v22", "v23");
+    __asm__ volatile(
+        "vsetvli t0, zero, e64, mf2   \n\t"
+        "vxor.vv v24, v24, v24        \n\t"
+        : : : "cc", "t0", "v24");
+    __asm__ volatile(
+        "vsetvli t0, zero, e64, mf4   \n\t"
+        "vxor.vv v25, v25, v25        \n\t"
+        : : : "cc", "t0", "v25");
+    for (uint32_t pass = 0; pass < passes; ++pass) {
+        for (uint64_t index = tile; index < count; index += tiles) {
+            const uint8_t* block = data + index * kUnit;
+
+            __asm__ volatile(
+                "vsetvli t0, zero, e8, m1     \n\t"
+                "vl4r.v  v4, (%[W])           \n\t"   /* 512 B of weights */
+                "vsetvli t0, zero, e8, mf2    \n\t"
+                "vle8.v  v30, (%[S])          \n\t"   /* 64 B of scales */
+                "vsetvli t0, zero, e8, mf4    \n\t"
+                "vle8.v  v3, (%[Z])           \n\t"   /* 32 B of zero points */
+                : : [W] "r"(block), [S] "r"(block + 512), [Z] "r"(block + 576)
+                : "cc", "t0", "v3", "v4", "v5", "v6", "v7", "v30", "memory");
+            __asm__ volatile(
+                "vsetvli t0, zero, e64, m1    \n\t"
+                "vadd.vv v20, v20, v4         \n\t"
+                "vadd.vv v21, v21, v5         \n\t"
+                "vadd.vv v22, v22, v6         \n\t"
+                "vadd.vv v23, v23, v7         \n\t"
+                : : : "cc", "t0", "v4", "v5", "v6", "v7", "v20", "v21", "v22", "v23");
+            __asm__ volatile(
+                "vsetvli t0, zero, e64, mf2   \n\t"
+                "vadd.vv v24, v24, v30        \n\t"
+                : : : "cc", "t0", "v24", "v30");
+            __asm__ volatile(
+                "vsetvli t0, zero, e64, mf4   \n\t"
+                "vadd.vv v25, v25, v3         \n\t"
+                : : : "cc", "t0", "v3", "v25");
+        }
+        __asm__ volatile(
+            "vsetvli t0, zero, e64, m1    \n\t"
+            "vmv.v.i v26, 0               \n\t"
+            "vredsum.vs v26, v20, v26     \n\t"
+            "vredsum.vs v26, v21, v26     \n\t"
+            "vredsum.vs v26, v22, v26     \n\t"
+            "vredsum.vs v26, v23, v26     \n\t"
+            "vmv.x.s t1, v26              \n\t"
+            "add %[VAL], %[VAL], t1       \n\t"
+            : [VAL] "+r"(accumulator)
+            : : "cc", "t0", "t1", "v20", "v21", "v22", "v23", "v26", "memory");
+        __asm__ volatile(
+            "vsetvli t0, zero, e64, mf2   \n\t"
+            "vmv.v.i v26, 0               \n\t"
+            "vredsum.vs v26, v24, v26     \n\t"
+            "vmv.x.s t1, v26              \n\t"
+            "add %[VAL], %[VAL], t1       \n\t"
+            : [VAL] "+r"(accumulator)
+            : : "cc", "t0", "t1", "v24", "v26", "memory");
+        __asm__ volatile(
+            "vsetvli t0, zero, e64, mf4   \n\t"
+            "vmv.v.i v26, 0               \n\t"
+            "vredsum.vs v26, v25, v26     \n\t"
+            "vmv.x.s t1, v26              \n\t"
+            "add %[VAL], %[VAL], t1       \n\t"
+            : [VAL] "+r"(accumulator)
+            : : "cc", "t0", "t1", "v25", "v26", "memory");
+        __asm__ volatile(
+            "vsetvli t0, zero, e64, m1    \n\t"
+            "vxor.vv v20, v20, v20        \n\t"
+            "vxor.vv v21, v21, v21        \n\t"
+            "vxor.vv v22, v22, v22        \n\t"
+            "vxor.vv v23, v23, v23        \n\t"
+            : : : "cc", "t0", "v20", "v21", "v22", "v23");
+        __asm__ volatile(
+            "vsetvli t0, zero, e64, mf2   \n\t"
+            "vxor.vv v24, v24, v24        \n\t"
+            : : : "cc", "t0", "v24");
+        __asm__ volatile(
+            "vsetvli t0, zero, e64, mf4   \n\t"
+            "vxor.vv v25, v25, v25        \n\t"
+            : : : "cc", "t0", "v25");
+    }
+    out[tile] = accumulator;
+}
+
+/* The host side: every byte of every whole 608-byte unit, summed as 64-bit words. */
+uint64_t host_checksum_608(const uint8_t* data, uint64_t bytes, uint32_t passes) {
+    const uint64_t units = bytes / 608;
+    uint64_t total = 0;
+
+    for (uint64_t unit = 0; unit < units; ++unit) {
+        const uint64_t* words = reinterpret_cast<const uint64_t*>(data + unit * 608);
+
+        for (int word = 0; word < 76; ++word)
+            total += words[word];
+    }
+    return total * passes;
+}
+
 void read_kernel_tiles_sequential(spert::Context* context, const uint8_t* data,
                                   uint64_t bytes, uint32_t passes, uint64_t* out) {
     const uint32_t tile = context->program_id(0);
@@ -1302,7 +1426,7 @@ int main(int argc, char** argv) {
     using kernel_fn = void (*)(spert::Context*, const uint8_t*, uint64_t, uint32_t,
                                uint64_t*);
     enum class kind { bytes, words, packed, packed_scaled, tiled, gemv1, gemv4, gemv8,
-                      smthp };
+                      smthp, d608 };
     const struct {
         const char* name;
         kernel_fn kernel;
@@ -1322,6 +1446,7 @@ int main(int argc, char** argv) {
         {"tiledblk", read_kernel_tiles_blocked, kind::tiled},
         {"decode608", read_kernel_decode_shape, kind::tiled},
         {"t608seq", read_kernel_608_sequential, kind::tiled},
+        {"d608vec", read_kernel_608_vector, kind::d608},
         /* the same packed read, serving 1, 4 and 8 rows from one pass over it */
         {"gemvR1", read_kernel_gemv<1>, kind::gemv1},
         {"gemvR4", read_kernel_gemv<4>, kind::gemv4},
@@ -1390,6 +1515,8 @@ int main(int argc, char** argv) {
                 expected = host_checksum_gemv<8>(buffer, bytes, passes);
             } else if (variant.how == kind::smthp) {
                 expected = host_checksum_smthp(buffer, bytes, passes);
+            } else if (variant.how == kind::d608) {
+                expected = host_checksum_608(buffer, bytes, passes);
             } else {
                 expected = host_checksum(buffer, bytes, passes);
             }
@@ -1408,6 +1535,8 @@ int main(int argc, char** argv) {
                                 : 0.0);
             if (variant.how == kind::tiled)
                 moved = static_cast<double>((bytes / kTileBytes) * kTileBytes);
+            if (variant.how == kind::d608)
+                moved = static_cast<double>((bytes / 608) * 608);
             double mib_per_s = seconds > 0.0 ? moved * passes / kMiB / seconds : 0.0;
             std::printf("%10zu %6s %8u %8u %10.4f %12.1f %s\n", size_mib,
                         variant.name, cores, passes, seconds, mib_per_s,
