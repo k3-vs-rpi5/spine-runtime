@@ -269,6 +269,22 @@ is: turning the pairing signal into a packing routine needs a deliberate solve
 (single 1 in both operands over (p,q), reading back which C slot answers), not
 another reading of the table.
 
+That solve has now been run - 256 cases, a single 1 in A at p and in B at q, one
+launch, clean exit - and its answer is not a permutation: only 33 of the 256 cases
+produce output, up to 12 C slots light per case, and **only the first two bytes of
+A participate at all** (p = 0 and 1 multiply with every q; p >= 2 produces
+nothing). One input 1 lighting many accumulators matches the specification's
+"sliding-packing" wording and the earlier 4-bit-lane finding, and the two-byte
+operand consumption, if it holds, would make a hand-written vmadot kernel on the
+A100 need many instructions per weight byte - the opposite of the vendor's 9.0
+and 5.8 GiB/s there.
+
+That is not yet a conclusion: the sweep used one configuration (`e8` with an
+`e32, m2` accumulator). The `e4`, `e16` and different-`vl` variants are what would
+say whether the small operand consumption is a property of this configuration or
+of the cluster. Recorded as the state of the A100 own-kernel route: a measured
+obstacle, a few configuration runs away from being settled.
+
 ## Workspace entry
 
 ```xml

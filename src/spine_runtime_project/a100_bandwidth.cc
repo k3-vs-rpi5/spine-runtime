@@ -363,41 +363,34 @@ static int ime_layout_probe(spert::Stream& stream, const uint32_t cores)
      * mapping, and a mapping that the runtime cannot corrupt into the heap is
      * worth more than a diagnosis of which allocator boundary it crosses. */
     bool huge = false;
-    uint8_t* buffer = allocate(32 * 32, &huge);
-    uint8_t* out_bytes = allocate(32 * 16 * sizeof(uint64_t), &huge);
+    uint8_t* buffer = allocate(256 * 32, &huge);
+    uint8_t* out_bytes = allocate(256 * 16 * sizeof(uint64_t), &huge);
     uint64_t* out = reinterpret_cast<uint64_t*>(out_bytes);
 
     if (buffer == nullptr || out_bytes == nullptr)
         return 1;
-    std::memset(buffer, 0, 32 * 32);
-    std::memset(out_bytes, 0, 32 * 16 * sizeof(uint64_t));
+    std::memset(buffer, 0, 256 * 32);
+    std::memset(out_bytes, 0, 256 * 16 * sizeof(uint64_t));
     std::fprintf(stderr, "ime-layout: buffers are page-aligned mappings\n");
 
-    for (int tile = 0; tile < 32; ++tile) {
-        uint8_t* slice = buffer + tile * 32;
-        int position = tile % 16;
+    /* One 1 in A and one in B per case, over all 16x16 combinations: two positions
+     * multiply only if they share the MAC's contraction index, so the nonzero
+     * (p,q) pairs partition the positions into k-classes, and the C slot that
+     * answers names the (row, column) each position carries. That is the whole
+     * packing question, asked in one launch. */
+    for (int tile_case = 0; tile_case < 256; ++tile_case) {
+        uint8_t* slice = buffer + tile_case * 32;
+        const int p = tile_case / 16;
+        const int q = tile_case % 16;
 
-        /* Distinctive values: the untouched operand carries 1..16 by position, so
-         * every C value that comes back names the position it paired with instead
-         * of only saying "something answered". */
-        for (int index = 0; index < 16; ++index) {
-            slice[index] = (uint8_t)(index + 1);
-            slice[16 + index] = (uint8_t)(index + 1);
-        }
-        if (tile < 16) {
-            for (int index = 0; index < 16; ++index)
-                slice[index] = 0;
-            slice[position] = 1;
-        } else {
-            for (int index = 16; index < 32; ++index)
-                slice[index] = 0;
-            slice[16 + position] = 1;
-        }
+        std::memset(slice, 0, 32);
+        slice[p] = 1;
+        slice[16 + q] = 1;
     }
     std::fprintf(stderr, "ime-layout: one launch, grid %u (the granted core count)\n",
                  cores);
-    std::fprintf(stderr, "ime-layout: A and B are 16 bytes each; values are 0 or 1\n");
-    auto future = stream.launch(spert::Grid(cores), probe_kernel, buffer, (uint64_t)1024,
+    std::fprintf(stderr, "ime-layout: A and B are 16 bytes each; 256 single-1 cases\n");
+    auto future = stream.launch(spert::Grid(cores), probe_kernel, buffer, (uint64_t)8192,
                                 1u, out);
 
     if (!future.valid()) {
@@ -406,19 +399,19 @@ static int ime_layout_probe(spert::Stream& stream, const uint32_t cores)
     }
     std::fprintf(stderr, "ime-layout: launched, waiting for sync\n");
     future.sync();
-    std::fprintf(stderr, "ime-layout: synced; nonzero C mask per case\n");
-    for (int tile = 0; tile < 32; ++tile) {
+    std::fprintf(stderr, "ime-layout: synced; p q -> copy0 copy1\n");
+    for (int tile = 0; tile < 256; ++tile) {
         const uint64_t mask = out[tile * 16 + 8];
         const int32_t* acc = reinterpret_cast<const int32_t*>(&out[tile * 16]);
         const int32_t* acc2 = acc + 8;
 
         std::fprintf(stderr,
-                     "  %s one at %2d -> copy0 [%d %d %d %d %d %d %d %d] "
-                     "copy1 [%d %d %d %d %d %d %d %d] mask 0x%02llx%s\n",
-                     tile < 16 ? "A" : "B", tile % 16,
+                     "  p=%2d q=%2d -> copy0 [%d %d %d %d %d %d %d %d] "
+                     "copy1 [%d %d %d %d %d %d %d %d] mask 0x%02llx\n",
+                     tile / 16, tile % 16,
                      acc[0], acc[1], acc[2], acc[3], acc[4], acc[5], acc[6], acc[7],
                      acc2[0], acc2[1], acc2[2], acc2[3], acc2[4], acc2[5], acc2[6],
-                     acc2[7], (unsigned long long)mask, mask ? "" : "  (no output)");
+                     acc2[7], (unsigned long long)mask);
     }
     return 0;
 }
