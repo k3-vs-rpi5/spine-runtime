@@ -306,80 +306,84 @@ uint64_t host_checksum_gemv(const uint8_t* data, uint64_t bytes, uint32_t passes
 void probe_kernel(spert::Context* context, const uint8_t* data, uint64_t bytes,
                   uint32_t passes, uint64_t* out) {
     int32_t acc[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    const uint32_t tile = context->program_id(0);
 
     (void)bytes;
     (void)passes;
-    if (context->program_id(0) != 0)
-        return;
-    __asm__ volatile(
-        "vsetvli t0, zero, e32, m2   \n\t"
-        "vle32.v v28, (%[ACC])       \n\t"
-        "vsetvli t0, zero, e8, m1    \n\t"
-        "vle8.v  v0, (%[A])          \n\t"
-        "vle8.v  v1, (%[B])          \n\t"
-        "vmadot  v28, v0, v1         \n\t"
-        "vsetvli t0, zero, e32, m2   \n\t"
-        "vse32.v v28, (%[ACC])       \n\t"
-        : : [A] "r"(data), [B] "r"(data + 16), [ACC] "r"(acc)
-        : "cc", "t0", "v0", "v1", "v28", "memory");
-    for (int index = 0; index < 8; ++index)
-        out[index] = (uint64_t)(uint32_t)acc[index];
+    /* The grid is the granted core count, which is the only shape this runtime
+     * has accepted so far (grid 1 spun, grid 32 faulted, grid == cores works in
+     * every other kernel here), so each tile walks four of the 32 cases. */
+    for (int step = 0; step < 4; ++step) {
+        const uint32_t tile_case = tile * 4 + (uint32_t)step;
+        const uint8_t* slice = data + (uint64_t)tile_case * 32;
+
+        for (int index = 0; index < 8; ++index)
+            acc[index] = 0;
+        __asm__ volatile(
+            "vsetvli t0, zero, e32, m2   \n\t"
+            "vle32.v v28, (%[ACC])       \n\t"
+            "vsetvli t0, zero, e8, m1    \n\t"
+            "vle8.v  v0, (%[A])          \n\t"
+            "vle8.v  v1, (%[B])          \n\t"
+            "vmadot  v28, v0, v1         \n\t"
+            "vsetvli t0, zero, e32, m2   \n\t"
+            "vse32.v v28, (%[ACC])       \n\t"
+            : : [A] "r"(slice), [B] "r"(slice + 16), [ACC] "r"(acc)
+            : "cc", "t0", "v0", "v1", "v28", "memory");
+        {
+            uint64_t mask = 0;
+
+            for (int index = 0; index < 8; ++index)
+                if (acc[index] != 0)
+                    mask |= (uint64_t)1 << index;
+            out[tile_case] = mask;
+        }
+    }
 }
 
 static int ime_layout_probe(spert::Stream& stream, const uint32_t cores)
 {
-    uint8_t* buffer = static_cast<uint8_t*>(std::calloc(1, 64 + 64));
-    std::vector<uint64_t> out(8, 0);
+    /* One launch, 32 cases: tiles 0-15 put a single 1 in one A position with B all
+     * ones, tiles 16-31 do the same for B. With a single 1 in one operand the
+     * product is 0 or 1 per accumulator, so each tile reports which of the eight
+     * C slots answered - the whole layout in one result vector. */
+    std::vector<uint8_t> buffer(32 * 32, 0);
+    std::vector<uint64_t> out(32, 0);
 
-    if (buffer == nullptr)
+    for (int tile = 0; tile < 32; ++tile) {
+        uint8_t* slice = buffer.data() + tile * 32;
+        int position = tile % 16;
+
+        std::memset(slice, 1, 32);
+        if (tile < 16) {
+            for (int index = 0; index < 16; ++index)
+                slice[index] = 0;
+            slice[position] = 1;
+        } else {
+            for (int index = 16; index < 32; ++index)
+                slice[index] = 0;
+            slice[16 + position] = 1;
+        }
+    }
+    std::fprintf(stderr, "ime-layout: one launch, grid %u (the granted core count)\n",
+                 cores);
+    std::fprintf(stderr, "ime-layout: A and B are 16 bytes each; values are 0 or 1\n");
+    auto future = stream.launch(spert::Grid(cores), probe_kernel, buffer.data(), (uint64_t)1024,
+                                1u, out.data());
+
+    if (!future.valid()) {
+        std::fprintf(stderr, "ime-layout: launch refused\n");
         return 1;
-    std::printf("vmadot layout probe: A[0..15] then B[0..15], C[0..7] int32\n");
-    std::printf("%-10s %s\n", "A one at", "C indices that answer (value in brackets)");
-    for (int position = 0; position < 16; ++position) {
-        std::fill(out.begin(), out.end(), 0);
-        std::memset(buffer, 0, 64);
-        buffer[position] = 1;
-        for (int index = 16; index < 32; ++index)
-            buffer[index] = 1;
-        auto future = stream.launch(spert::Grid(cores), probe_kernel, buffer, (uint64_t)32,
-                                    1u, out.data());
-
-        if (!future.valid()) {
-            std::printf("launch failed\n");
-            std::free(buffer);
-            return 1;
-        }
-        future.sync();
-        std::printf("%-10d", position);
-        for (int index = 0; index < 8; ++index)
-            if (out[index])
-                std::printf(" C[%d]=%llu", index, (unsigned long long)out[index]);
-        std::printf("\n");
     }
-    std::printf("%-10s %s\n", "B one at", "C indices that answer (value in brackets)");
-    for (int position = 0; position < 16; ++position) {
-        std::fill(out.begin(), out.end(), 0);
-        std::memset(buffer, 0, 64);
-        for (int index = 0; index < 16; ++index)
-            buffer[index] = 1;
-        buffer[16 + position] = 1;
-        auto future = stream.launch(spert::Grid(cores), probe_kernel, buffer, (uint64_t)32,
-                                    1u, out.data());
-
-        if (!future.valid()) {
-            std::printf("launch failed\n");
-            std::free(buffer);
-            return 1;
-        }
-        future.sync();
-        std::printf("%-10d", position);
-        for (int index = 0; index < 8; ++index)
-            if (out[index])
-                std::printf(" C[%d]=%llu", index, (unsigned long long)out[index]);
-        std::printf("\n");
+    std::fprintf(stderr, "ime-layout: launched, waiting for sync\n");
+    future.sync();
+    std::fprintf(stderr, "ime-layout: synced; nonzero C mask per case\n");
+    for (int tile = 0; tile < 32; ++tile) {
+        std::fprintf(stderr, "  %s one at %2d -> C mask 0x%02llx%s\n",
+                     tile < 16 ? "A" : "B", tile % 16,
+                     (unsigned long long)out[tile],
+                     out[tile] ? "" : "  (no output)");
     }
-    std::free(buffer);
-    (void)cores;
     return 0;
 }
 
@@ -473,6 +477,9 @@ void usage() {
 
 int main(int argc, char** argv) {
     std::vector<size_t> sizes;
+    /* Unbuffered stderr: a probe that faults must still leave its last steps
+     * visible, which a block-buffered stdout does not. */
+    std::setvbuf(stderr, nullptr, _IONBF, 0);
     bool layout_probe = false;
 
     if (argc == 2 && (std::strcmp(argv[1], "-h") == 0 ||

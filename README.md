@@ -217,12 +217,23 @@ After a reboot the cluster is healthy again (`a100_probe` reports
 `kernels=ok mismatches=0 us_per_launch=31.2`; `a100_bandwidth 64` reports
 `word 24,881 MiB/s`), so the state that breaks is runtime-side. The rules that
 follow apply to every harness in this workspace: never kill a process with a
-launch in flight, treat a segfault in the submitter the same way, and after any
-abnormal exit re-establish cluster health before trusting the next measurement.
-The probe itself is unfinished - it first spun (a one-tile grid on an eight-core
-stream, no `future.valid()` check) and then segfaulted with its diagnostics lost
-to stdout buffering; the next version needs unbuffered output, a single launch,
-and no kill-based timeout.
+launch in flight, and after any abnormal exit re-establish cluster health before
+trusting the next measurement rather than assuming either outcome - three
+observations say a kill poisoned the runtime twice, a segfault once, and the
+latest segfault not at all (`a100_probe` and `a100_bandwidth` were healthy right
+after it).
+
+The probe itself is unfinished, in three stages so far: it first spun (a one-tile
+grid on an eight-core stream, no `future.valid()` check), then segfaulted with its
+diagnostics lost to stdout buffering, then - with unbuffered stderr and a single
+launch over all 32 cases - still segfaulted, with the output localising that to
+the launch/sync boundary. Two concrete differences from every kernel here that
+works point at the next experiments: this one executes `vmadot` (at VLEN=128,
+SEW=8 the selected MAC unit is 2x2x4[x2], and the specification says an
+unimplemented unit is an illegal instruction, so SEW=4 and SEW=16 variants and an
+`e32, m1` accumulator would name the unit this cluster implements), and its
+accumulator is a host-stack array where the working kernels write only into the
+buffer the launch was given.
 
 ## Workspace entry
 
