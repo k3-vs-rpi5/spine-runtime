@@ -43,24 +43,36 @@ mode on the X100 cores and `generic/qemu` is for functional validation only.
 
 ## The A100 ISA flag and the kernels we submit
 
-`scripts/build.sh` compiles the two binaries for the cluster
-(`-mcpu=spacemit-a100`, overridable with `SPERT_A100_FLAGS`) because their kernels
-run there. Measured on 2026-09-19, that flag decides whether they run at all:
+`scripts/build.sh` compiles the two binaries for the cluster because their
+kernels run there: the default is `-march=rv64imafdcv_zicsr_zifencei_zba_zbb_zbs_xsmtvdotii -mtune=spacemit-a100`, which names the A100 ISA and the vendor scheduling model
+without the blanket `-mcpu` switch. `SPERT_A100_FLAGS` overrides it.
 
-| build | `a100_bandwidth 64` completed runs |
+The matrix that chose it, five runs of `a100_bandwidth 64` each (four variants
+per run, so a run counts only if all four completed):
+
+| build | completed runs |
 |---|---|
-| plain `rv64gc` | 3 of 3 |
-| `-mcpu=spacemit-a100` | 0 of 3 |
-| `-mcpu=spacemit-a100 -fno-tree-vectorize` | 0 of 3 |
+| plain `rv64gc` | 4 of 5 |
+| `-mtune=spacemit-a100` only | 3 of 5 |
+| `-march` without vector | 3 of 5 |
+| `-march` with vector | 4 of 5 |
+| `-march` with vector and `_xsmtvdotii` | 3 of 5 |
+| `-mcpu=spacemit-a100` | **0 of 5** |
 
-The vector-free build crashes too, so this is not the auto-vectoriser; the simple
-probe kernel survives either way, so it is not the flag breaking every kernel.
-Until that is understood, the bandwidth numbers below are scalar-code numbers -
-and they are still worth having, because a scalar streaming kernel already
-reaches **24,627 MiB/s** at a 1.5 GiB working set, which is the same ceiling the
-X100-side probe reports. The memory roof therefore stands whatever the
-instruction mix is, and the decode path's own 65,792-byte tiled walk - 22,658 MiB/s,
-8 % below a plain stream - is what serial decode is measured against.
+Two findings, and one correction to an earlier claim here. The correction: the
+first measurement of this (three runs) reported "the flag decides whether they
+run at all"; with five runs the truth is narrower - only the blanket
+`-mcpu=spacemit-a100` fails deterministically, and every partial set behaves like
+the plain build. That also means the tool is **intrinsically flaky**: even the
+plain build fails roughly one run in five, which is an open defect of the tool or
+its use of the runtime, not of any ISA option, and it is why the default now
+avoids the switch that fails every time.
+
+The roof is unaffected by all of it: plain and vector builds agree on a plain
+stream at 24.6 GiB/s and on the decode path's own tiled walk near 23 GiB/s, so
+the ceiling is the bus and not the instruction mix. The scalar nibble-unpack
+variant reads 2.7 GiB/s in every build; answering whether the 4-bit format itself
+can feed the bus still needs a hand-written vector unpack.
 
 ## Workspace entry
 

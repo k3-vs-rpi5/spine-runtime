@@ -26,11 +26,19 @@ STAGE=${SPERT_STAGE:-$WORKSPACE/.local/spine-runtime/stage}
 mkdir -p "$OUT" "$STAGE"
 
 echo "== build the A100 probe (riscv64) =="
-# The kernels these binaries submit run on the AI cluster, so they have to be
-# compiled for it: without an A100 flag the toolchain emits plain rv64gc code and
-# the microbenchmark measures the scalar issue rate of one core instead of the
-# cluster's memory path. Measured by comparing the same sweep both ways.
-A100_FLAGS=${SPERT_A100_FLAGS:--mcpu=spacemit-a100}
+# The kernels these binaries submit run on the AI cluster, so they are compiled
+# for it: without an A100 ISA the toolchain emits plain rv64gc code and the
+# microbenchmark measures one core's scalar issue rate instead of the cluster's
+# memory path.
+#
+# The default names the A100 ISA explicitly (vector, and the IME2 family through
+# _xsmtvdotii) plus the vendor scheduling model, rather than using the single
+# -mcpu=spacemit-a100 switch, because that switch measures 0 completions in 5
+# runs of a100_bandwidth while this set, plain rv64gc, tuning-only and
+# vector-without-IME2 all complete 3 to 4 of 5 - see README "The A100 ISA flag
+# and the kernels we submit" for the whole matrix. SPERT_A100_FLAGS overrides it
+# for a re-measurement.
+A100_FLAGS=${SPERT_A100_FLAGS:--march=rv64imafdcv_zicsr_zifencei_zba_zbb_zbs_xsmtvdotii -mtune=spacemit-a100}
 if ! "$CXX" $A100_FLAGS -E - </dev/null >/dev/null 2>&1; then
     echo "toolchain does not accept $A100_FLAGS; the bandwidth numbers would be scalar" >&2
     exit 1
