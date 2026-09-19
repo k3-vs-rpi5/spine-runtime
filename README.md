@@ -358,6 +358,36 @@ in-register dequantisation, `vfmacc` accumulation, four rows per weight read -
 verify it against a scalar reference, and measure it against that 9.0 GiB/s. The
 IME layout work is not on that path any more.
 
+### The RVV gemv is written, verified, and 4.5 times behind
+
+`a100_bandwidth` now carries `rvvgemv`: standard RVV in the vendor's shape, 4-bit
+blocks streamed 16 bytes at a time, each block multiplied by its scale and
+accumulated, checked against a host reference. It needed one fix worth recording -
+the u32 *reduction* sums 16 lanes, so the drain window has to fit 16 lanes' worth
+in u32 rather than one lane's; draining every 1,024 blocks overflowed (the
+reference caught it), every 64 does not.
+
+At a 1536 MiB working set, with every row verified:
+
+| variant | MiB/s |
+|---|---|
+| `word` (plain stream) | 24,166 |
+| `tiled` | 22,357 |
+| `gemvR1` / `gemvR4` / `gemvR8` (one read serving 1/4/8 rows) | 2,691 / 2,500 / 2,594 |
+| `pack4` (scalar unpack) | 2,730 |
+| `pack4v` (RVV unpack) | 2,145 |
+| `rvvgemv` (RVV in the vendor's shape) | 2,012 |
+| vendor `i8i4_m1` (kernel probe) | 9,000 |
+
+So the own-kernel path is technically open - the vendor uses ordinary RVV and our
+kernel runs and verifies on the cluster - but it is 4.5 times slower than the kernel it
+would have to beat, and no variant written here came closer than 2,700 MiB/s.
+Closing that gap means matching a hand-tuned loop (`vl4r.v` segment loads,
+in-register float conversion, `vfmacc` pipelining and their scheduling), which is a
+re-implementation project whose payoff is bounded by the 25 % to 30 % the vendor's
+four-row chunking loses in the first place. Recorded as measured, with the choice
+left open rather than taken.
+
 ## Workspace entry
 
 ```xml

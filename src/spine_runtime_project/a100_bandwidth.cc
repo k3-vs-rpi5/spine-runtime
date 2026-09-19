@@ -135,6 +135,29 @@ uint64_t host_checksum_packed(const uint8_t* data, uint64_t bytes, uint32_t pass
     return total;
 }
 
+/* The same read with the scale applied to each block, which is what a
+ * quantisation-aware kernel does: sum of nibbles times the block's scale. */
+uint64_t host_checksum_packed_scaled(const uint8_t* data, uint64_t bytes, uint32_t passes) {
+    const uint64_t blocks = bytes / 16;
+    const uint8_t* scales = data + bytes;
+    uint64_t total = 0;
+
+    for (uint32_t pass = 0; pass < passes; ++pass)
+        for (uint64_t block = 0; block < blocks; ++block) {
+            uint16_t scale = 0;
+            uint64_t nibbles = 0;
+
+            for (uint64_t index = 0; index < 16; ++index) {
+                const uint8_t byte = data[block * 16 + index];
+
+                nibbles += (byte & 0x0fu) + (byte >> 4);
+            }
+            __builtin_memcpy(&scale, scales + block * 2, sizeof(scale));
+            total += nibbles * (uint64_t)scale;
+        }
+    return total;
+}
+
 /* The vendor's decode path reads its weights in calls that average 65,792 bytes
  * (282,805 MiB over 4,506,936 calls), scattered across a 1.5 GiB weight set
  * rather than one contiguous run. This variant reproduces exactly that: the
@@ -290,6 +313,92 @@ uint64_t host_checksum_gemv(const uint8_t* data, uint64_t bytes, uint32_t passes
 
 #ifdef HAVE_RVV
 static uint8_t* allocate(size_t bytes, bool* huge);
+
+/* An RVV gemv in the shape the vendor's own kernels use.
+ *
+ * Disassembling `spacemit_kernels::ime2::gemm_kernel_i8i4_m1` in the board's
+ * libggml-cpu.so.0.16.0 shows hand-written standard RVV - `vl4r.v` segmented
+ * loads, `vfcvt.f.x.v` dequantisation, `vfmacc.vf` accumulation, and no `vmadot`
+ * anywhere in the library - so the question "can our own kernel reach the
+ * vendor's 9.0 GiB/s" is a question about RVV, not about the IME layout.
+ *
+ * This kernel streams the same 4-bit block format the other variants use (16 data
+ * bytes + a 2-byte scale per 32 weights), unpacks the nibbles with RVV, multiplies
+ * each block by its scale in u32 lanes and accumulates. It keeps integer
+ * semantics on purpose: the host reference can then check it exactly, which is
+ * what a rate is allowed to rest on. Lanes are flushed into a scalar total every
+ * 1,024 blocks (a lane holds at most 15*65535 per block) so the u32 cannot wrap.
+ */
+void read_kernel_rvv_gemv(spert::Context* context, const uint8_t* data, uint64_t bytes,
+                          uint32_t passes, uint64_t* out) {
+    const uint32_t tile = context->program_id(0);
+    const uint32_t tiles = context->grid_dim(0);
+    const uint64_t per_tile = bytes / tiles;
+    const uint64_t blocks = per_tile / 16;
+    const uint8_t* base = data + static_cast<uint64_t>(tile) * per_tile;
+    const uint8_t* scales = data + bytes + static_cast<uint64_t>(tile) * blocks * 2;
+    uint64_t accumulator = 0;
+    const size_t vl = __riscv_vsetvl_e8m1(16);
+    vuint32m4_t lanes = __riscv_vmv_v_x_u32m4(0, vl);
+
+    for (uint32_t pass = 0; pass < passes; ++pass) {
+        uint64_t block = 0;
+
+        for (; block + 2 <= blocks; block += 2) {
+            for (int index = 0; index < 2; ++index) {
+                const vuint8m1_t packed =
+                    __riscv_vle8_v_u8m1(base + (block + index) * 16, vl);
+                const vuint8m1_t low = __riscv_vand_vx_u8m1(packed, 0x0f, vl);
+                const vuint8m1_t high = __riscv_vsrl_vx_u8m1(packed, 4, vl);
+                uint16_t scale = 0;
+
+                __builtin_memcpy(&scale, scales + (block + index) * 2, sizeof(scale));
+                lanes = __riscv_vadd_vv_u32m4(
+                    lanes,
+                    __riscv_vmul_vx_u32m4(
+                        __riscv_vzext_vf4_u32m4(low, vl), (uint32_t)scale, vl),
+                    vl);
+                lanes = __riscv_vadd_vv_u32m4(
+                    lanes,
+                    __riscv_vmul_vx_u32m4(
+                        __riscv_vzext_vf4_u32m4(high, vl), (uint32_t)scale, vl),
+                    vl);
+            }
+            /* Drain every 64 blocks, not every 1,024: a lane holds at most
+             * 15 * 65,535 per block, and the u32 *reduction* sums 16 lanes, so the
+             * window that has to fit in u32 is 16 x the per-lane total. 64 blocks
+             * keeps that near 1e9. Draining less often overflowed and the host
+             * reference caught it. */
+            if ((block & 63) == 0) {
+                const vuint32m1_t zero = __riscv_vmv_v_x_u32m1(0, vl);
+                const vuint32m1_t drained =
+                    __riscv_vredsum_vs_u32m4_u32m1(lanes, zero, vl);
+
+                accumulator += (uint64_t)__riscv_vmv_x_s_u32m1_u32(drained);
+                lanes = __riscv_vmv_v_x_u32m4(0, vl);
+            }
+        }
+        for (; block < blocks; ++block) {
+            uint16_t scale = 0;
+            uint64_t sum = 0;
+
+            for (uint64_t index = 0; index < 16; ++index) {
+                const uint8_t byte = base[block * 16 + index];
+
+                sum += (byte & 0x0fu) + (byte >> 4);
+            }
+            __builtin_memcpy(&scale, scales + block * 2, sizeof(scale));
+            accumulator += sum * (uint64_t)scale;
+        }
+    }
+    {
+        const vuint32m1_t zero = __riscv_vmv_v_x_u32m1(0, vl);
+        const vuint32m1_t total = __riscv_vredsum_vs_u32m4_u32m1(lanes, zero, vl);
+
+        accumulator += (uint64_t)__riscv_vmv_x_s_u32m1_u32(total);
+    }
+    out[tile] = accumulator;
+}
 
 /* Same probe with a different operand configuration, to see whether "only two
  * bytes of A participate" is a property of one vsetvli setting or of the cluster.
@@ -689,7 +798,7 @@ int main(int argc, char** argv) {
 
     using kernel_fn = void (*)(spert::Context*, const uint8_t*, uint64_t, uint32_t,
                                uint64_t*);
-    enum class kind { bytes, words, packed, tiled, gemv1, gemv4, gemv8 };
+    enum class kind { bytes, words, packed, packed_scaled, tiled, gemv1, gemv4, gemv8 };
     const struct {
         const char* name;
         kernel_fn kernel;
@@ -700,6 +809,7 @@ int main(int argc, char** argv) {
         {"pack4", read_kernel_packed, kind::packed},
 #ifdef HAVE_RVV
         {"pack4v", read_kernel_packed_vector, kind::packed},
+        {"rvvgemv", read_kernel_rvv_gemv, kind::packed_scaled},
 #endif
         {"tiled", read_kernel_tiles, kind::tiled},
         /* the same packed read, serving 1, 4 and 8 rows from one pass over it */
@@ -758,6 +868,8 @@ int main(int argc, char** argv) {
                         expected += words[index];
             } else if (variant.how == kind::packed) {
                 expected = host_checksum_packed(buffer, bytes, passes);
+            } else if (variant.how == kind::packed_scaled) {
+                expected = host_checksum_packed_scaled(buffer, bytes, passes);
             } else if (variant.how == kind::tiled) {
                 expected = host_checksum_tiles(buffer, bytes, passes);
             } else if (variant.how == kind::gemv1) {
@@ -776,7 +888,8 @@ int main(int argc, char** argv) {
             /* The packed variant moves its scale region as well, so its traffic
              * is what the kernels would read: data plus scales. */
             double moved = static_cast<double>(bytes) +
-                           (variant.how == kind::packed || variant.how == kind::gemv1 ||
+                           (variant.how == kind::packed || variant.how == kind::packed_scaled ||
+                            variant.how == kind::gemv1 ||
                             variant.how == kind::gemv4 || variant.how == kind::gemv8
                                 ? static_cast<double>(scale_bytes)
                                 : 0.0);
