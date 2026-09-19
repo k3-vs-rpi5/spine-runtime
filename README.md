@@ -107,6 +107,29 @@ compiler targets a machine that is not there; GCC 15 accepts only `scalable` or
 `word` falls from 24,759 to 9,741 MiB/s. A hand-written kernel is the only way
 left to that question, and it has to carry its own checksum.
 
+## The hand-written kernel does not reach the vendor's rate either
+
+That hand-written kernel now exists for the unpack part (`pack4v`, RVV
+intrinsics, host-verified) and it answers the question the other way:
+
+| variant | MiB/s |
+|---|---|
+| `word` (plain stream) | 24,168 |
+| `tiled` | 23,233 |
+| `pack4` (scalar unpack) | 2,728 |
+| `pack4v` (RVV unpack) | 2,536 |
+
+The vector unpack is **slower** than the scalar loop, and both are 3.3 to 3.6 times
+below the vendor's one-row kernel (9.0 GiB/s). The vendor's advantage is almost
+certainly the IME2 instruction family, which the toolchain can emit but whose
+programming model is not documented in this workspace. So the structural finding
+- that batching loses 25 % to 30 % to the vendor's kernel structure rather than to
+the memory path - stands, but cashing it would need IME2 documentation rather
+than more measurement here. Two side results are kept in the record: a lane-wise
+reduction version was faster and wrong (the mismatch equalled one pass of nibble
+sums), and the tool now prints expected and got on a mismatch instead of only
+"mismatch".
+
 ## Workspace entry
 
 ```xml

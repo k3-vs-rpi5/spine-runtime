@@ -20,6 +20,11 @@
  */
 #include "spert.hpp"
 
+#if defined(__riscv_v) && __riscv_v >= 1000000
+#include <riscv_vector.h>
+#define HAVE_RVV 1
+#endif
+
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -283,6 +288,77 @@ uint64_t host_checksum_gemv(const uint8_t* data, uint64_t bytes, uint32_t passes
     return total;
 }
 
+#ifdef HAVE_RVV
+/* The same packed read as `read_kernel_packed`, with the nibble extraction done
+ * in vector instructions.
+ *
+ * The scalar version of this loop reads 2.7 GiB/s and the question is how much
+ * of that is the arithmetic and how much is the memory: the plain `word` stream
+ * reaches 24.7 GiB/s and the vendor's own one-row kernel 9.0 GiB/s, so if a
+ * vector unpack lands near 9 the structure can feed a multi-row kernel and if it
+ * lands near 3 it cannot.
+ *
+ * This is the simple form: each 16-byte block is loaded, its nibbles are summed
+ * across lanes with one `vredsum`, and the block's scale is added in scalar code
+ * - the arithmetic the scalar variant and the host reference perform.
+ *
+ * A lane-wise version that reduced only once at the end was tried and is not
+ * kept: it needs periodic draining to avoid u16 overflow, and the version
+ * written here lost its vector contribution entirely (the mismatch equalled one
+ * pass of nibble sums), so a kernel nobody has time to chase is worth less than a
+ * slower one whose checksum passes. */
+void read_kernel_packed_vector(spert::Context* context, const uint8_t* data, uint64_t bytes,
+                               uint32_t passes, uint64_t* out) {
+    const uint32_t tile = context->program_id(0);
+    const uint32_t tiles = context->grid_dim(0);
+    const uint64_t per_tile = bytes / tiles;
+    const uint64_t blocks = per_tile / 16;
+    const uint8_t* base = data + static_cast<uint64_t>(tile) * per_tile;
+    const uint8_t* scales = data + bytes + static_cast<uint64_t>(tile) * blocks * 2;
+    uint64_t accumulator = 0;
+    const size_t vl = __riscv_vsetvl_e8m1(16);
+
+    for (uint32_t pass = 0; pass < passes; ++pass) {
+        uint64_t block = 0;
+
+        for (; block + 4 <= blocks; block += 4) {
+            for (int index = 0; index < 4; ++index) {
+                const vuint8m1_t packed =
+                    __riscv_vle8_v_u8m1(base + (block + index) * 16, vl);
+                const vuint8m1_t nibbles = __riscv_vadd_vv_u8m1(
+                    __riscv_vand_vx_u8m1(packed, 0x0f, vl),
+                    __riscv_vsrl_vx_u8m1(packed, 4, vl), vl);
+                const vuint16m1_t zero = __riscv_vmv_v_x_u16m1(0, vl);
+                const vuint16m1_t wide =
+                    __riscv_vredsum_vs_u16m2_u16m1(__riscv_vzext_vf2_u16m2(nibbles, vl), zero,
+                                             vl);
+
+                accumulator += (uint64_t)__riscv_vmv_x_s_u16m1_u16(wide);
+            }
+            for (int index = 0; index < 4; ++index) {
+                uint16_t scale = 0;
+
+                __builtin_memcpy(&scale, scales + (block + index) * 2, sizeof(scale));
+                accumulator += scale;
+            }
+        }
+        for (; block < blocks; ++block) {
+            uint16_t scale = 0;
+            uint64_t nibbles = 0;
+
+            for (uint64_t index = 0; index < 16; ++index) {
+                const uint8_t byte = base[block * 16 + index];
+
+                nibbles += (byte & 0x0fu) + (byte >> 4);
+            }
+            __builtin_memcpy(&scale, scales + block * 2, sizeof(scale));
+            accumulator += nibbles + scale;
+        }
+    }
+    out[tile] = accumulator;
+}
+#endif
+
 uint8_t* allocate(size_t bytes, bool* huge) {
     const size_t page = 2 * kMiB;
     size_t rounded = (bytes + page - 1) / page * page;
@@ -362,6 +438,9 @@ int main(int argc, char** argv) {
         {"byte", read_kernel, kind::bytes},
         {"word", read_kernel_words, kind::words},
         {"pack4", read_kernel_packed, kind::packed},
+#ifdef HAVE_RVV
+        {"pack4v", read_kernel_packed_vector, kind::packed},
+#endif
         {"tiled", read_kernel_tiles, kind::tiled},
         /* the same packed read, serving 1, 4 and 8 rows from one pass over it */
         {"gemvR1", read_kernel_gemv<1>, kind::gemv1},
@@ -447,6 +526,11 @@ int main(int argc, char** argv) {
             std::printf("%10zu %6s %8u %8u %10.4f %12.1f %s\n", size_mib,
                         variant.name, cores, passes, seconds, mib_per_s,
                         got == expected ? "ok" : "MISMATCH");
+            if (got != expected)
+                std::printf("           %s: expected %llu got %llu (delta %lld)\n",
+                            variant.name, (unsigned long long)expected,
+                            (unsigned long long)got,
+                            (long long)got - (long long)expected);
             std::printf("RESULT size_mib=%zu kernel=%s cores=%u passes=%u seconds=%.4f mib_per_s=%.1f moved_mib=%.1f hugepages=%d checksum=%s\n",
                         size_mib, variant.name, cores, passes, seconds, mib_per_s,
                         moved / kMiB, huge ? 1 : 0,
