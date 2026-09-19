@@ -95,6 +95,18 @@ this kernel is scalar, so it shows R does not change *its* rate and not that it
 reaches the vendor's. A vector-unpacking version is the next step, and the build
 now accepts an A100 ISA that runs.
 
+## Do not ask the compiler to vectorise these kernels
+
+Trying to shortcut the vector-unpacking work with `-O3 -mrvv-vector-bits=zvl`
+produces **wrong answers for every variant**, including the trivial `word` and
+`byte` loops - caught only because each variant is checked against a host-side
+reference. `zvl` takes the vector length from the `-march` string, and the vendor
+extension set carries `zvl1024b` while the AI cores have `vlen=128`, so the
+compiler targets a machine that is not there; GCC 15 accepts only `scalable` or
+`zvl`, so 128 cannot be named directly either. The build is not faster:
+`word` falls from 24,759 to 9,741 MiB/s. A hand-written kernel is the only way
+left to that question, and it has to carry its own checksum.
+
 ## Workspace entry
 
 ```xml
