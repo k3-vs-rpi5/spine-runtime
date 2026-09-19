@@ -19,6 +19,7 @@
  *   a100_bandwidth [size_mib ...]        default: 8 64 256
  */
 #include "spert.hpp"
+#include "spine_tcm.h"
 
 #if defined(__riscv_v) && __riscv_v >= 1000000
 #include <riscv_vector.h>
@@ -337,6 +338,71 @@ void read_kernel_tile_size(spert::Context* context, const uint8_t* data, uint64_
 }
 
 /* The host side of each of those, which is the same sum over the same bytes. */
+/* The copy-style model: what the decode path actually does. Its staging copy
+ * moves DDR bytes into the core's own TCM and the work then reads TCM, so a
+ * read-into-a-register loop is not the same operation and its rate is not the
+ * decode's. Same tile loop as `read_kernel_tile_size`, so the sizes are
+ * comparable, and one accumulator at the same place in both halves.
+ *
+ * `tcm_blocks` is the host's per-AI-core TCM array: the header resolves it
+ * through the board's libspine_tcm.so, which is also how the vendor backend
+ * obtains the buffer it stages into. */
+template <uint64_t TILE>
+void read_kernel_stage(spert::Context* context, const uint8_t* data, uint64_t bytes,
+                       uint32_t passes, uint64_t* out, const uint8_t* const* tcm_blocks) {
+    const uint32_t tile = context->program_id(0);
+    const uint32_t tiles = context->grid_dim(0);
+    const uint64_t count = bytes / TILE;
+    uint8_t* tcm = const_cast<uint8_t*>(tcm_blocks[tile]);
+    uint64_t accumulator = 0;
+
+    out[tile] = 0;
+    if (tcm == nullptr || count == 0)
+        return;
+    for (uint32_t pass = 0; pass < passes; ++pass)
+        for (uint64_t index = tile; index < count; index += tiles) {
+            const uint64_t* source = reinterpret_cast<const uint64_t*>(data + index * TILE);
+            uint64_t* destination = reinterpret_cast<uint64_t*>(tcm);
+
+            for (uint64_t word = 0; word < TILE / sizeof(uint64_t); ++word)
+                destination[word] = source[word];
+            for (uint64_t word = 0; word < TILE / sizeof(uint64_t); ++word)
+                accumulator += destination[word];
+        }
+    out[tile] = accumulator;
+}
+
+/* A control for the tile-size sweep. That sweep accumulates into one variable, so
+ * a longer tile is also a longer serial dependency chain at one add per word; four
+ * accumulators break the chain without changing which bytes are read or in what
+ * order. If the sweep's shape effect is the memory path's, this control keeps it;
+ * if it was the inner loop's latency, the four sizes converge. */
+template <uint64_t TILE>
+void read_kernel_tile_size_unrolled(spert::Context* context, const uint8_t* data,
+                                    uint64_t bytes, uint32_t passes, uint64_t* out) {
+    const uint32_t tile = context->program_id(0);
+    const uint32_t tiles = context->grid_dim(0);
+    const uint64_t count = bytes / TILE;
+    uint64_t accumulator[4] = { 0, 0, 0, 0 };
+
+    if (count == 0) {
+        out[tile] = 0;
+        return;
+    }
+    for (uint32_t pass = 0; pass < passes; ++pass)
+        for (uint64_t index = tile; index < count; index += tiles) {
+            const uint64_t* base = reinterpret_cast<const uint64_t*>(data + index * TILE);
+
+            for (uint64_t word = 0; word + 4 <= TILE / sizeof(uint64_t); word += 4) {
+                accumulator[0] += base[word];
+                accumulator[1] += base[word + 1];
+                accumulator[2] += base[word + 2];
+                accumulator[3] += base[word + 3];
+            }
+        }
+    out[tile] = accumulator[0] + accumulator[1] + accumulator[2] + accumulator[3];
+}
+
 uint64_t host_checksum_tile_size(const uint8_t* data, uint64_t bytes, uint32_t passes,
                                  uint64_t tile_bytes) {
     const uint64_t units = bytes / tile_bytes;
@@ -1496,6 +1562,26 @@ int main(int argc, char** argv) {
 
     std::printf("stream: requested %zu cores (ids 8-15), granted %u\n", info.num_cores,
                 cores);
+    /* The copy-style variants stage into each core's own TCM, which the board's
+     * spine_tcm hands out per AI core id - the same call the vendor backend
+     * makes. Acquired once and released at exit, because they belong to the
+     * process, not to a launch. */
+    std::vector<const uint8_t*> tcm(cores, nullptr);
+    bool have_tcm = spine_tcm_is_available();
+
+    for (uint32_t core = 0; have_tcm && core < cores; ++core)
+        tcm[core] = static_cast<const uint8_t*>(spine_tcm_mem_get((int) core));
+    if (have_tcm) {
+        spine_tcm_mem_info_t layout = {};
+
+        if (spine_tcm_mem_info(&layout) == 0)
+            std::fprintf(stderr, "stage: %u cores, TCM block %zu bytes, %zu blocks\n", cores,
+                         (size_t) layout.blk_size, (size_t) layout.blk_num);
+        else
+            std::fprintf(stderr, "stage: %u cores hold a TCM block\n", cores);
+    } else {
+        std::fprintf(stderr, "stage: no TCM on this board, the stage variants will report 0\n");
+    }
 #ifdef HAVE_RVV
     if (layout_probe)
         return ime_layout_probe(stream, cores);
@@ -1603,8 +1689,10 @@ int main(int argc, char** argv) {
 
     using kernel_fn = void (*)(spert::Context*, const uint8_t*, uint64_t, uint32_t,
                                uint64_t*);
+    using kernel_fn_stage = void (*)(spert::Context*, const uint8_t*, uint64_t, uint32_t,
+                                     uint64_t*, const uint8_t* const*);
     enum class kind { bytes, words, packed, packed_scaled, tiled, gemv1, gemv4, gemv8,
-                      smthp, d608, tilesize };
+                      smthp, d608, tilesize, stage };
     const struct {
         const char* name;
         kernel_fn kernel;
@@ -1630,6 +1718,14 @@ int main(int argc, char** argv) {
         {"t64k", read_kernel_tile_size<65536>, kind::tilesize},
         {"t38912blk", read_kernel_tile_size_blocked<38912>, kind::tilesize},
         {"t65536blk", read_kernel_tile_size_blocked<65536>, kind::tilesize},
+        {"t8ku", read_kernel_tile_size_unrolled<8192>, kind::tilesize},
+        {"t16ku", read_kernel_tile_size_unrolled<16384>, kind::tilesize},
+        {"t38912u", read_kernel_tile_size_unrolled<38912>, kind::tilesize},
+        {"t64ku", read_kernel_tile_size_unrolled<65536>, kind::tilesize},
+        /* the copy-style model, one loop for every size */
+        {"stage8k", (kernel_fn) read_kernel_stage<8192>, kind::stage},
+        {"stage38912", (kernel_fn) read_kernel_stage<38912>, kind::stage},
+        {"stage64k", (kernel_fn) read_kernel_stage<65536>, kind::stage},
         {"sizemix", read_kernel_size_mix, kind::tilesize},
         {"d608vec", read_kernel_608_vector, kind::d608},
         {"d608int", read_kernel_608_intrinsic, kind::d608},
@@ -1665,10 +1761,16 @@ int main(int argc, char** argv) {
             for (int attempt = 0; attempt < 4; ++attempt) {
                 std::fill(out.begin(), out.end(), 0);
                 auto start = std::chrono::steady_clock::now();
-                auto future = stream.launch(spert::Grid{cores}, variant.kernel,
-                                            static_cast<const uint8_t*>(buffer),
-                                            static_cast<uint64_t>(bytes), passes,
-                                            out.data());
+                auto future = variant.how == kind::stage
+                                  ? stream.launch(spert::Grid{cores},
+                                                  (kernel_fn_stage) variant.kernel,
+                                                  static_cast<const uint8_t*>(buffer),
+                                                  static_cast<uint64_t>(bytes), passes,
+                                                  out.data(), tcm.data())
+                                  : stream.launch(spert::Grid{cores}, variant.kernel,
+                                                  static_cast<const uint8_t*>(buffer),
+                                                  static_cast<uint64_t>(bytes), passes,
+                                                  out.data());
                 future.sync();
                 auto end = std::chrono::steady_clock::now();
 
@@ -1703,7 +1805,7 @@ int main(int argc, char** argv) {
                 expected = host_checksum_smthp(buffer, bytes, passes);
             } else if (variant.how == kind::d608) {
                 expected = host_checksum_608(buffer, bytes, passes);
-            } else if (variant.how == kind::tilesize) {
+            } else if (variant.how == kind::tilesize || variant.how == kind::stage) {
                 uint64_t tile_bytes = 8192;
 
                 if (std::strcmp(variant.name, "t16k") == 0)
@@ -1715,6 +1817,16 @@ int main(int argc, char** argv) {
                 else if (std::strcmp(variant.name, "t38912blk") == 0)
                     tile_bytes = 38912;
                 else if (std::strcmp(variant.name, "t65536blk") == 0)
+                    tile_bytes = 65536;
+                else if (std::strcmp(variant.name, "t16ku") == 0)
+                    tile_bytes = 16384;
+                else if (std::strcmp(variant.name, "t38912u") == 0)
+                    tile_bytes = 38912;
+                else if (std::strcmp(variant.name, "t64ku") == 0)
+                    tile_bytes = 65536;
+                else if (std::strcmp(variant.name, "stage38912") == 0)
+                    tile_bytes = 38912;
+                else if (std::strcmp(variant.name, "stage64k") == 0)
                     tile_bytes = 65536;
                 else if (std::strcmp(variant.name, "sizemix") == 0)
                     tile_bytes = 931840;
@@ -1739,7 +1851,7 @@ int main(int argc, char** argv) {
                 moved = static_cast<double>((bytes / kTileBytes) * kTileBytes);
             if (variant.how == kind::d608)
                 moved = static_cast<double>((bytes / 608) * 608);
-            if (variant.how == kind::tilesize) {
+            if (variant.how == kind::tilesize || variant.how == kind::stage) {
                 uint64_t tile_bytes = 8192;
 
                 if (std::strcmp(variant.name, "t16k") == 0)
@@ -1751,6 +1863,16 @@ int main(int argc, char** argv) {
                 else if (std::strcmp(variant.name, "t38912blk") == 0)
                     tile_bytes = 38912;
                 else if (std::strcmp(variant.name, "t65536blk") == 0)
+                    tile_bytes = 65536;
+                else if (std::strcmp(variant.name, "t16ku") == 0)
+                    tile_bytes = 16384;
+                else if (std::strcmp(variant.name, "t38912u") == 0)
+                    tile_bytes = 38912;
+                else if (std::strcmp(variant.name, "t64ku") == 0)
+                    tile_bytes = 65536;
+                else if (std::strcmp(variant.name, "stage38912") == 0)
+                    tile_bytes = 38912;
+                else if (std::strcmp(variant.name, "stage64k") == 0)
                     tile_bytes = 65536;
                 else if (std::strcmp(variant.name, "sizemix") == 0)
                     tile_bytes = 931840;
@@ -1772,5 +1894,9 @@ int main(int argc, char** argv) {
         }
         munmap(buffer, bytes + scale_bytes);
     }
+    for (uint32_t core = 0; have_tcm && core < cores; ++core)
+        if (tcm[core] != nullptr)
+            spine_tcm_mem_free((int) core);
     return 0;
 }
+/* The host side of each of those, which is the same sum over the same bytes. */
