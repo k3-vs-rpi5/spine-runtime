@@ -74,6 +74,27 @@ the ceiling is the bus and not the instruction mix. The scalar nibble-unpack
 variant reads 2.7 GiB/s in every build; answering whether the 4-bit format itself
 can feed the bus still needs a hand-written vector unpack.
 
+## One read serving R rows
+
+`a100_bandwidth` also carries `gemvR1`, `gemvR4` and `gemvR8`: one pass over the
+packed 4-bit weights, serving 1, 4 and 8 activation rows, each checked against a
+host-side reference. Measured at a 1.5 GiB working set:
+
+| variant | MiB/s |
+|---|---|
+| `gemvR1` | 2,610 |
+| `gemvR4` | 2,481 |
+| `gemvR8` | 2,547 |
+
+The rate is flat as R grows, while the vendor's own kernels lose it: its one-row
+`i8i4` kernel streams at 9.0 GiB/s and its four-row one at 5.8 GiB/s during a
+decode run. That is the shape of the question this repository can answer for the
+LLM work - the 25 % to 30 % batching loses to regrouping is a property of the
+vendor kernel structure rather than of the memory path - with the caveat that
+this kernel is scalar, so it shows R does not change *its* rate and not that it
+reaches the vendor's. A vector-unpacking version is the next step, and the build
+now accepts an A100 ISA that runs.
+
 ## Workspace entry
 
 ```xml

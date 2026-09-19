@@ -208,6 +208,81 @@ void read_kernel_words(spert::Context* context, const uint8_t* data, uint64_t by
     out[tile] = accumulator;
 }
 
+/* One weight read serving R activation rows.
+ *
+ * This is the question the vendor's decode path leaves open. Its one-row kernels
+ * stream at 9.0 GiB/s and its four-row kernels at 5.8 GiB/s, so batching loses
+ * weight bandwidth exactly when it is supposed to amortise the read. This kernel
+ * keeps the read identical and lets the arithmetic grow with the row count: each
+ * packed block is unpacked once and multiplied by R activations (here r+1, a
+ * value that costs nothing to obtain and is exactly reproducible on the host, so
+ * a fast-but-wrong kernel cannot pass).
+ *
+ * If the rate holds as R grows, the amortisation the vendor loses is recoverable
+ * in principle and only its kernel structure prevents it. */
+template <int R>
+void read_kernel_gemv(spert::Context* context, const uint8_t* data, uint64_t bytes,
+                      uint32_t passes, uint64_t* out) {
+    const uint32_t tile = context->program_id(0);
+    const uint32_t tiles = context->grid_dim(0);
+    const uint64_t per_tile = bytes / tiles;            /* packed data bytes */
+    const uint64_t blocks = per_tile / 16;              /* 16 data bytes per 32 weights */
+    const uint8_t* base = data + static_cast<uint64_t>(tile) * per_tile;
+    const uint8_t* scales = data + bytes + static_cast<uint64_t>(tile) * blocks * 2;
+    uint64_t accumulator = 0;
+
+    for (uint32_t pass = 0; pass < passes; ++pass)
+        for (uint64_t block = 0; block < blocks; ++block) {
+            const uint8_t* packed = base + block * 16;
+            uint64_t low = 0, high = 0;
+            uint16_t scale = 0;
+            uint64_t nibbles = 0;
+            uint64_t scaled;
+
+            __builtin_memcpy(&low, packed, sizeof(low));
+            __builtin_memcpy(&high, packed + 8, sizeof(high));
+            __builtin_memcpy(&scale, scales + block * 2, sizeof(scale));
+            for (unsigned shift = 0; shift < 64; shift += 8) {
+                const uint8_t low_byte = (uint8_t)(low >> shift);
+                const uint8_t high_byte = (uint8_t)(high >> shift);
+
+                nibbles += (low_byte & 0x0fu) + (low_byte >> 4);
+                nibbles += (high_byte & 0x0fu) + (high_byte >> 4);
+            }
+            scaled = nibbles * scale;
+            /* R rows consume the same read; the row weights are what makes the
+             * arithmetic grow without touching memory again. */
+            for (int row = 0; row < R; ++row)
+                accumulator += scaled * static_cast<uint64_t>(row + 1);
+        }
+    out[tile] = accumulator;
+}
+
+template <int R>
+uint64_t host_checksum_gemv(const uint8_t* data, uint64_t bytes, uint32_t passes) {
+    const uint64_t blocks = bytes / 16;
+    const uint8_t* scales = data + bytes;
+    uint64_t total = 0;
+    uint64_t row_weight = 0;
+
+    for (int row = 0; row < R; ++row)
+        row_weight += static_cast<uint64_t>(row + 1);
+    for (uint32_t pass = 0; pass < passes; ++pass)
+        for (uint64_t block = 0; block < blocks; ++block) {
+            uint16_t scale = 0;
+            uint64_t nibbles = 0;
+
+            for (uint64_t index = 0; index < 16; ++index) {
+                const uint8_t byte = data[block * 16 + index];
+
+                nibbles += (byte & 0x0fu) + (byte >> 4);
+            }
+            __builtin_memcpy(&scale, scales + block * 2, sizeof(scale));
+            total += nibbles * scale * row_weight;
+        }
+    return total;
+}
+
 uint8_t* allocate(size_t bytes, bool* huge) {
     const size_t page = 2 * kMiB;
     size_t rounded = (bytes + page - 1) / page * page;
@@ -278,7 +353,7 @@ int main(int argc, char** argv) {
 
     using kernel_fn = void (*)(spert::Context*, const uint8_t*, uint64_t, uint32_t,
                                uint64_t*);
-    enum class kind { bytes, words, packed, tiled };
+    enum class kind { bytes, words, packed, tiled, gemv1, gemv4, gemv8 };
     const struct {
         const char* name;
         kernel_fn kernel;
@@ -288,6 +363,10 @@ int main(int argc, char** argv) {
         {"word", read_kernel_words, kind::words},
         {"pack4", read_kernel_packed, kind::packed},
         {"tiled", read_kernel_tiles, kind::tiled},
+        /* the same packed read, serving 1, 4 and 8 rows from one pass over it */
+        {"gemvR1", read_kernel_gemv<1>, kind::gemv1},
+        {"gemvR4", read_kernel_gemv<4>, kind::gemv4},
+        {"gemvR8", read_kernel_gemv<8>, kind::gemv8},
     };
 
     std::printf("%10s %6s %8s %8s %10s %12s %s\n", "size_MiB", "kernel", "cores",
@@ -342,6 +421,12 @@ int main(int argc, char** argv) {
                 expected = host_checksum_packed(buffer, bytes, passes);
             } else if (variant.how == kind::tiled) {
                 expected = host_checksum_tiles(buffer, bytes, passes);
+            } else if (variant.how == kind::gemv1) {
+                expected = host_checksum_gemv<1>(buffer, bytes, passes);
+            } else if (variant.how == kind::gemv4) {
+                expected = host_checksum_gemv<4>(buffer, bytes, passes);
+            } else if (variant.how == kind::gemv8) {
+                expected = host_checksum_gemv<8>(buffer, bytes, passes);
             } else {
                 expected = host_checksum(buffer, bytes, passes);
             }
@@ -352,7 +437,10 @@ int main(int argc, char** argv) {
             /* The packed variant moves its scale region as well, so its traffic
              * is what the kernels would read: data plus scales. */
             double moved = static_cast<double>(bytes) +
-                           (variant.how == kind::packed ? static_cast<double>(scale_bytes) : 0.0);
+                           (variant.how == kind::packed || variant.how == kind::gemv1 ||
+                            variant.how == kind::gemv4 || variant.how == kind::gemv8
+                                ? static_cast<double>(scale_bytes)
+                                : 0.0);
             if (variant.how == kind::tiled)
                 moved = static_cast<double>((bytes / kTileBytes) * kTileBytes);
             double mib_per_s = seconds > 0.0 ? moved * passes / kMiB / seconds : 0.0;
