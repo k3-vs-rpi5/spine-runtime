@@ -181,6 +181,29 @@ interchangeable, which is why the demo (written for VLEN=256) passes here.
 Not yet done: a multi-core version, a decode-shaped K, and any end-to-end token
 rate.
 
+## The A100 needs its own layout work, and that is measured rather than read
+
+The decode work runs on the A100 cluster, so the kernel that matters is an A100
+one - and the A100 has **VLEN=128** against the X100's 256. The IM
+specification's `Copies` rule makes that difference structural:
+`Copies = (sqrt(VLEN/64) is an integer) ? 1 : 2`, so VLEN=128 gives Copies=2 and
+VLEN=256 gives Copies=1, and with them different operand packings (at VLEN=128,
+SEW=8 selects a 2x2x4 MAC unit; at VLEN=256 it is 4x4x8).
+
+Two consequences are recorded rather than assumed: the vendor demo, verified
+correct here, is a **VLEN=256** kernel and its layout does not transfer; and a
+kernel written from the specification's prose alone - A as `Copies*(M,K)`
+row-major, B as `Copies*(K,N)` K-major, one `vmadot` per 2x2 output with K=8 -
+compiles and runs on the A100 but does **not** reproduce the reference (four of
+four outputs differ). The specification's operand figures are images and its
+integer pseudocode indexes C as an (M,N) matrix with `i*K + j`, which cannot hold
+for M != N.
+
+The way through is to measure the permutation with a layout probe submitted
+through `spert` on cores 8-15, exactly as this workspace measured how tracepoint
+programs attach: source as hypothesis, probe as fact. Then the packing, then the
+rate at R=1, 2 and 4 against the vendor's 9.0 and 5.8 GiB/s.
+
 ## Workspace entry
 
 ```xml
