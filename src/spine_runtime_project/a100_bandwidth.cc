@@ -337,6 +337,97 @@ void read_kernel_tile_size(spert::Context* context, const uint8_t* data, uint64_
     out[tile] = accumulator;
 }
 
+/* Decode's own thread-to-column geometry, read-only and chain-free. The blocked
+ * assignment gives each *pair* of lanes one quarter of the tensor and lets the
+ * two lanes alternate 32-column spans inside it, which is what the weight-order
+ * trace measured (91.7 % of a thread's successive reads are that stripe). Every
+ * variant of this kernel uses the same four accumulators, so the loop structure
+ * is held constant and only the geometry moves. */
+template <uint64_t SPAN>
+void read_kernel_decode_order(spert::Context* context, const uint8_t* data, uint64_t bytes,
+                              uint32_t passes, uint64_t* out) {
+    const uint32_t lane = context->program_id(0);
+    const uint32_t lanes = context->grid_dim(0);
+    const uint32_t pairs = lanes / 2 ? lanes / 2 : 1;
+    const uint32_t pair = lane / 2 % pairs;
+    const uint32_t parity = lane % 2;
+    const uint64_t per_pair = bytes / pairs;
+    const uint64_t spans = per_pair / SPAN;
+    uint64_t accumulator[4] = { 0, 0, 0, 0 };
+
+    for (uint32_t pass = 0; pass < passes; ++pass)
+        for (uint64_t index = parity; index < spans; index += 2) {
+            const uint64_t* base =
+                reinterpret_cast<const uint64_t*>(data + (uint64_t) pair * per_pair + index * SPAN);
+
+            for (uint64_t word = 0; word + 4 <= SPAN / sizeof(uint64_t); word += 4) {
+                accumulator[0] += base[word];
+                accumulator[1] += base[word + 1];
+                accumulator[2] += base[word + 2];
+                accumulator[3] += base[word + 3];
+            }
+        }
+    out[lane] = accumulator[0] + accumulator[1] + accumulator[2] + accumulator[3];
+}
+
+/* The same geometry with the staging copy in it: what decode does to the bytes
+ * before its kernel sees them. The read-back is chain-free on purpose - a serial
+ * sum made the first version of this kernel measure its own reduction. */
+template <uint64_t SPAN>
+void read_kernel_decode_order_stage(spert::Context* context, const uint8_t* data,
+                                    uint64_t bytes, uint32_t passes, uint64_t* out,
+                                    const uint8_t* const* tcm_blocks) {
+    const uint32_t lane = context->program_id(0);
+    const uint32_t lanes = context->grid_dim(0);
+    const uint32_t pairs = lanes / 2 ? lanes / 2 : 1;
+    const uint32_t pair = lane / 2 % pairs;
+    const uint32_t parity = lane % 2;
+    const uint64_t per_pair = bytes / pairs;
+    const uint64_t spans = per_pair / SPAN;
+    uint64_t* tcm = reinterpret_cast<uint64_t*>(const_cast<uint8_t*>(tcm_blocks[lane]));
+    uint64_t accumulator[4] = { 0, 0, 0, 0 };
+
+    out[lane] = 0;
+    if (tcm == nullptr)
+        return;
+    for (uint32_t pass = 0; pass < passes; ++pass)
+        for (uint64_t index = parity; index < spans; index += 2) {
+            const uint64_t* base =
+                reinterpret_cast<const uint64_t*>(data + (uint64_t) pair * per_pair + index * SPAN);
+
+            for (uint64_t word = 0; word < SPAN / sizeof(uint64_t); ++word)
+                tcm[word] = base[word];
+            for (uint64_t word = 0; word + 4 <= SPAN / sizeof(uint64_t); word += 4) {
+                accumulator[0] += tcm[word];
+                accumulator[1] += tcm[word + 1];
+                accumulator[2] += tcm[word + 2];
+                accumulator[3] += tcm[word + 3];
+            }
+        }
+    out[lane] = accumulator[0] + accumulator[1] + accumulator[2] + accumulator[3];
+}
+
+/* The host side: the same quarters, the same parity split, the same floor. */
+template <uint64_t SPAN>
+uint64_t host_checksum_decode_order(const uint8_t* data, uint64_t bytes, uint32_t passes,
+                                    uint32_t lanes) {
+    const uint32_t pairs = lanes / 2 ? lanes / 2 : 1;
+    const uint64_t per_pair = bytes / pairs;
+    const uint64_t spans = per_pair / SPAN;
+    uint64_t total = 0;
+
+    for (uint32_t pass = 0; pass < passes; ++pass)
+        for (uint32_t pair = 0; pair < pairs; ++pair)
+            for (uint64_t index = 0; index < spans; ++index) {
+                const uint64_t* base = reinterpret_cast<const uint64_t*>(
+                    data + (uint64_t) pair * per_pair + index * SPAN);
+
+                for (uint64_t word = 0; word < SPAN / sizeof(uint64_t); ++word)
+                    total += base[word];
+            }
+    return total;
+}
+
 /* The host side of each of those, which is the same sum over the same bytes. */
 /* The copy-style model: what the decode path actually does. Its staging copy
  * moves DDR bytes into the core's own TCM and the work then reads TCM, so a
@@ -1692,7 +1783,7 @@ int main(int argc, char** argv) {
     using kernel_fn_stage = void (*)(spert::Context*, const uint8_t*, uint64_t, uint32_t,
                                      uint64_t*, const uint8_t* const*);
     enum class kind { bytes, words, packed, packed_scaled, tiled, gemv1, gemv4, gemv8,
-                      smthp, d608, tilesize, stage };
+                      smthp, d608, tilesize, stage, decodeorder };
     const struct {
         const char* name;
         kernel_fn kernel;
@@ -1726,6 +1817,10 @@ int main(int argc, char** argv) {
         {"stage8k", (kernel_fn) read_kernel_stage<8192>, kind::stage},
         {"stage38912", (kernel_fn) read_kernel_stage<38912>, kind::stage},
         {"stage64k", (kernel_fn) read_kernel_stage<65536>, kind::stage},
+        /* decode's own geometry: four pairs, each pair's lanes alternating spans */
+        {"dord38k", read_kernel_decode_order<38912>, kind::decodeorder},
+        {"dord64k", read_kernel_decode_order<65536>, kind::decodeorder},
+        {"dord38ks", (kernel_fn) read_kernel_decode_order_stage<38912>, kind::stage},
         {"sizemix", read_kernel_size_mix, kind::tilesize},
         {"d608vec", read_kernel_608_vector, kind::d608},
         {"d608int", read_kernel_608_intrinsic, kind::d608},
@@ -1805,6 +1900,12 @@ int main(int argc, char** argv) {
                 expected = host_checksum_smthp(buffer, bytes, passes);
             } else if (variant.how == kind::d608) {
                 expected = host_checksum_608(buffer, bytes, passes);
+            } else if (variant.how == kind::decodeorder ||
+                       std::strcmp(variant.name, "dord38ks") == 0) {
+                if (std::strcmp(variant.name, "dord64k") == 0)
+                    expected = host_checksum_decode_order<65536>(buffer, bytes, passes, cores);
+                else
+                    expected = host_checksum_decode_order<38912>(buffer, bytes, passes, cores);
             } else if (variant.how == kind::tilesize || variant.how == kind::stage) {
                 uint64_t tile_bytes = 8192;
 
@@ -1849,6 +1950,13 @@ int main(int argc, char** argv) {
                                 : 0.0);
             if (variant.how == kind::tiled)
                 moved = static_cast<double>((bytes / kTileBytes) * kTileBytes);
+            if (variant.how == kind::decodeorder ||
+                std::strcmp(variant.name, "dord38ks") == 0) {
+                const uint64_t span = std::strcmp(variant.name, "dord64k") == 0 ? 65536 : 38912;
+                const uint64_t pairs = cores / 2 ? cores / 2 : 1;
+
+                moved = static_cast<double>((bytes / pairs / span) * span * pairs);
+            }
             if (variant.how == kind::d608)
                 moved = static_cast<double>((bytes / 608) * 608);
             if (variant.how == kind::tilesize || variant.how == kind::stage) {
