@@ -289,6 +289,100 @@ uint64_t host_checksum_gemv(const uint8_t* data, uint64_t bytes, uint32_t passes
 }
 
 #ifdef HAVE_RVV
+/* Layout probe for vmadot on this cluster.
+ *
+ * The IME specification pins the operand *shapes* down (Copies*(M,K) in vs1,
+ * Copies*(K,N) in vs2, an even vd pair for Copies*(M,N) int32) but its operand
+ * figures are images and its integer pseudocode indexes C as an (M,N) matrix with
+ * i*K + j, which cannot hold when M != N. A kernel written from that prose alone
+ * runs on the A100 and produces wrong answers, and the vendor demo is a VLEN=256
+ * kernel whose layout does not transfer to this cluster's VLEN=128.
+ *
+ * So the permutation is measured here instead of read: the buffer carries A (16
+ * bytes) followed by B (16 bytes), the caller puts a single 1 in one position and
+ * 1s everywhere else, and the resulting C says which (row, k) that position
+ * feeds. Same method this workspace used for tracepoint attachment: source as
+ * hypothesis, probe as fact. */
+void probe_kernel(spert::Context* context, const uint8_t* data, uint64_t bytes,
+                  uint32_t passes, uint64_t* out) {
+    int32_t acc[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+
+    (void)bytes;
+    (void)passes;
+    if (context->program_id(0) != 0)
+        return;
+    __asm__ volatile(
+        "vsetvli t0, zero, e32, m2   \n\t"
+        "vle32.v v28, (%[ACC])       \n\t"
+        "vsetvli t0, zero, e8, m1    \n\t"
+        "vle8.v  v0, (%[A])          \n\t"
+        "vle8.v  v1, (%[B])          \n\t"
+        "vmadot  v28, v0, v1         \n\t"
+        "vsetvli t0, zero, e32, m2   \n\t"
+        "vse32.v v28, (%[ACC])       \n\t"
+        : : [A] "r"(data), [B] "r"(data + 16), [ACC] "r"(acc)
+        : "cc", "t0", "v0", "v1", "v28", "memory");
+    for (int index = 0; index < 8; ++index)
+        out[index] = (uint64_t)(uint32_t)acc[index];
+}
+
+static int ime_layout_probe(spert::Stream& stream, const uint32_t cores)
+{
+    uint8_t* buffer = static_cast<uint8_t*>(std::calloc(1, 64 + 64));
+    std::vector<uint64_t> out(8, 0);
+
+    if (buffer == nullptr)
+        return 1;
+    std::printf("vmadot layout probe: A[0..15] then B[0..15], C[0..7] int32\n");
+    std::printf("%-10s %s\n", "A one at", "C indices that answer (value in brackets)");
+    for (int position = 0; position < 16; ++position) {
+        std::fill(out.begin(), out.end(), 0);
+        std::memset(buffer, 0, 64);
+        buffer[position] = 1;
+        for (int index = 16; index < 32; ++index)
+            buffer[index] = 1;
+        auto future = stream.launch(spert::Grid(cores), probe_kernel, buffer, (uint64_t)32,
+                                    1u, out.data());
+
+        if (!future.valid()) {
+            std::printf("launch failed\n");
+            std::free(buffer);
+            return 1;
+        }
+        future.sync();
+        std::printf("%-10d", position);
+        for (int index = 0; index < 8; ++index)
+            if (out[index])
+                std::printf(" C[%d]=%llu", index, (unsigned long long)out[index]);
+        std::printf("\n");
+    }
+    std::printf("%-10s %s\n", "B one at", "C indices that answer (value in brackets)");
+    for (int position = 0; position < 16; ++position) {
+        std::fill(out.begin(), out.end(), 0);
+        std::memset(buffer, 0, 64);
+        for (int index = 0; index < 16; ++index)
+            buffer[index] = 1;
+        buffer[16 + position] = 1;
+        auto future = stream.launch(spert::Grid(cores), probe_kernel, buffer, (uint64_t)32,
+                                    1u, out.data());
+
+        if (!future.valid()) {
+            std::printf("launch failed\n");
+            std::free(buffer);
+            return 1;
+        }
+        future.sync();
+        std::printf("%-10d", position);
+        for (int index = 0; index < 8; ++index)
+            if (out[index])
+                std::printf(" C[%d]=%llu", index, (unsigned long long)out[index]);
+        std::printf("\n");
+    }
+    std::free(buffer);
+    (void)cores;
+    return 0;
+}
+
 /* The same packed read as `read_kernel_packed`, with the nibble extraction done
  * in vector instructions.
  *
@@ -379,6 +473,7 @@ void usage() {
 
 int main(int argc, char** argv) {
     std::vector<size_t> sizes;
+    bool layout_probe = false;
 
     if (argc == 2 && (std::strcmp(argv[1], "-h") == 0 ||
                       std::strcmp(argv[1], "--help") == 0)) {
@@ -388,6 +483,10 @@ int main(int argc, char** argv) {
     for (int index = 1; index < argc; ++index) {
         long value = std::strtol(argv[index], nullptr, 10);
 
+        if (std::strcmp(argv[index], "--ime-layout") == 0) {
+            layout_probe = true;
+            continue;
+        }
         if (value <= 0) {
             usage();
             return 2;
@@ -426,6 +525,10 @@ int main(int argc, char** argv) {
 
     std::printf("stream: requested %zu cores (ids 8-15), granted %u\n", info.num_cores,
                 cores);
+#ifdef HAVE_RVV
+    if (layout_probe)
+        return ime_layout_probe(stream, cores);
+#endif
 
     using kernel_fn = void (*)(spert::Context*, const uint8_t*, uint64_t, uint32_t,
                                uint64_t*);

@@ -204,6 +204,26 @@ through `spert` on cores 8-15, exactly as this workspace measured how tracepoint
 programs attach: source as hypothesis, probe as fact. Then the packing, then the
 rate at R=1, 2 and 4 against the vendor's 9.0 and 5.8 GiB/s.
 
+### An abnormal exit mid-launch takes the runtime down
+
+Two attempts at that probe, both ending in the same place:
+
+| event | symptom | recovery |
+|---|---|---|
+| the probe was `pkill`ed mid-run | every later stream refused (`reason=stream-refused`), `a100_probe` silent, TCM 8 of 8 free | reboot |
+| the probe segfaulted | the same, including for the plain `a100_bandwidth 64` that had just worked | reboot |
+
+After a reboot the cluster is healthy again (`a100_probe` reports
+`kernels=ok mismatches=0 us_per_launch=31.2`; `a100_bandwidth 64` reports
+`word 24,881 MiB/s`), so the state that breaks is runtime-side. The rules that
+follow apply to every harness in this workspace: never kill a process with a
+launch in flight, treat a segfault in the submitter the same way, and after any
+abnormal exit re-establish cluster health before trusting the next measurement.
+The probe itself is unfinished - it first spun (a one-tile grid on an eight-core
+stream, no `future.valid()` check) and then segfaulted with its diagnostics lost
+to stdout buffering; the next version needs unbuffered output, a single launch,
+and no kill-based timeout.
+
 ## Workspace entry
 
 ```xml
