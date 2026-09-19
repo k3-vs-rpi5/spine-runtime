@@ -130,6 +130,29 @@ reduction version was faster and wrong (the mismatch equalled one pass of nibble
 sums), and the tool now prints expected and got on a mismatch instead of only
 "mismatch".
 
+## The IME documentation exists, and the instructions run on the X100 cores
+
+The paragraph above was written before looking for the specification. It does
+exist - `spacemit-com/riscv-ime-extension-spec` publishes the instructions
+(`vmadot`, `vmadot1`/`2`/`3`/`n`, `vmadotu`/`su`/`us`, and the float
+`vfmadot*` family), their types (int4/int8/int16, fp4/fp8/fp16/bf16), the MAC
+unit selected from `vl*SEW`, and the programmer's model (RVV registers, no added
+state, VLEN 128 to 4096, SEW 4/8/16, LMUL <= 1) - and its
+`example/vmadot-gemm-demo.c` is a self-testing 4x8x4 int8 GEMM.
+
+Measured here: the example compiles with `-march=rv64gcv_xsmtvdotii` (plain
+`-march=rv64gcv` refuses the mnemonic) and prints `Test successful. CRef equal to
+C.` on the **X100 cores**, under `taskset -c 0` as well. A loop of the same shape
+measures 786 Mmac/s scalar against 18,286 Mmac/s with `vmadot` - 23 times - with
+**different results**, because the MAC unit at VLEN=128 and SEW=8 is 2x2x4[x2]
+and the operands have to be packed the way the example's `Gemm_packB` does.
+
+So the claim that IME2 is undocumented and reachable only through the AI-cluster
+runtime does not hold for this board: the instruction set is published and
+executes as ordinary userspace code on the Linux cluster. Writing our own
+multi-row kernel is open again, with a packing routine to write and a self-test to
+pass first.
+
 ## Workspace entry
 
 ```xml

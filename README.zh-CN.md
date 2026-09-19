@@ -107,6 +107,24 @@ API 与调度模型是公开的。
 归约的版本更快但结果错误（失配量恰好等于一个 pass 的半字节和），以及工具现在在失配时
 同时打印期望值与实际值，而不只是 "mismatch"。
 
+## IME 文档是存在的，而且这些指令在 X100 核上可运行
+
+上面那段写在查阅规范之前。规范确实存在——`spacemit-com/riscv-ime-extension-spec`
+公布了指令（`vmadot`、`vmadot1`/`2`/`3`/`n`、`vmadotu`/`su`/`us`，以及浮点的
+`vfmadot*` 族）、数据类型（int4/int8/int16、fp4/fp8/fp16/bf16）、由 `vl*SEW` 决定的
+MAC 单元，以及编程模型（复用 RVV 寄存器、不新增状态、VLEN 128–4096、SEW 4/8/16、
+LMUL ≤ 1）——其 `example/vmadot-gemm-demo.c` 是一个自带自检的 4x8x4 int8 GEMM。
+
+本地实测：该示例用 `-march=rv64gcv_xsmtvdotii` 编译（纯 `-march=rv64gcv` 会拒绝该
+助记符），在 **X100 核**上运行并打印 `Test successful. CRef equal to C.`，`taskset -c 0`
+同样通过。同形状的循环实测：标量 786 Mmac/s，`vmadot` 18,286 Mmac/s——23 倍——但
+**结果不同**，因为 VLEN=128、SEW=8 时 MAC 单元是 2x2x4[x2]，操作数必须按示例里
+`Gemm_packB` 的方式打包。
+
+所以“IME2 无文档、只能经智算簇运行时到达”这句话对本板不成立：指令集是公开的，并且作为
+普通用户态代码在 Linux 簇上执行。自己写多行内核这件事重新开放，前提是先写好打包例程并
+通过自检。
+
 ## 工作区登记
 
 ```xml
