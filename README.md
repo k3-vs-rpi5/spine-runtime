@@ -33,9 +33,13 @@ mode on the X100 cores and `generic/qemu` is for functional validation only.
 - automation exists: `scripts/build.sh` cross-builds `src/spine_runtime_project/a100_probe.cc` against
   the SDK and the board's `spine_tcm` header, and `scripts/run.sh` delivers and
   runs it, keeping the output as evidence.
-- measured on the board: the default backend reports `arch_id 0xa064` (A100),
-  eight granted cores, and 59.9 % AI-cluster busy by `/proc/stat` during a
-  900000-launch window, agreeing with the per-CPU counters.
+- measured on the board: the default backend reports `arch_id 0xa064` (A100) and
+  grants eight cores (ids 8-15), and a 900000-launch window is evidenced from the
+  vendor side - the runtime's registration of that work and the TCM blocks
+  granted to the submitting pid - together with the throughput arithmetic the
+  kernel's own size and launch count imply. Per-CPU counters and `/proc/stat` are
+  recorded but are not A100 evidence here: measured on 2026-09-18, the cluster's
+  work does not move them.
 
 ## The A100 ISA flag and the kernels we submit
 
