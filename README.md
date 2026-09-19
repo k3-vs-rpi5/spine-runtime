@@ -415,6 +415,30 @@ except this time the specification that exists documents a family the decode ker
 does not use. Recorded, with the vendor-kernel facts and the np=4 / lockstep
 guidance unchanged.
 
+### A round over the public material: the decode kernel's families are not published
+
+Checked, in order:
+
+| source | result |
+|---|---|
+| the IME specification (26-line instruction list, release v1.0 PDF) | lists only `vmadot*` (funct7 0x70/0x71) and `vfmadot*` (0x74) - none of the decode kernel's five families |
+| every published toolchain (`archive.spacemit.com/toolchain/`, newest v1.2.4 of this line and the 2026-06-30 musl-oh build) | identical assembler mnemonic set (34 `smt.*`), identical binutils revision, and neither decodes the decode kernel's words (40 `.insn` each) |
+| the vendor's public repositories | one IME repository (the specification), documentation trees and SDK/backend repositories; nothing carrying those encodings |
+
+So the families the 9.0 GiB/s kernel runs are **not in public material** - not in
+the spec, not in any published assembler, not in any published disassembler, not
+in the repositories. That is why no amount of work here closes the 4.5x gap: the
+instructions cannot be assembled in this workspace, and obtaining them (or an
+assembler for them) is a human step.
+
+**One public family is still untested**: `sf.vqmacc.2x8x2` and `sf.vqmacc.4x8x4`
+with their `u`/`su`/`us` forms - opcode 0x5b, quad-nibble matrix MACs, public,
+assemblable here with `-march=rv64gcv_xsfvqmaccdod_xsfvqmaccqoq`, and shaped
+exactly like the row counts the vendor's kernels are named after. It is the only
+instruction family available in this workspace that is designed for the same job,
+which makes it the one own-kernel experiment still worth running before the route
+is closed.
+
 ## Workspace entry
 
 ```xml
