@@ -141,8 +141,9 @@ state, VLEN 128 to 4096, SEW 4/8/16, LMUL <= 1) - and its
 `example/vmadot-gemm-demo.c` is a self-testing 4x8x4 int8 GEMM.
 
 Measured here: the example compiles with `-march=rv64gcv_xsmtvdotii` (plain
-`-march=rv64gcv` refuses the mnemonic) and prints `Test successful. CRef equal to
-C.` on the **X100 cores**, under `taskset -c 0` as well. A loop of the same shape
+`-march=rv64gcv` refuses the mnemonic) and prints
+`Test successful. CRef equal to C.` on the **X100 cores**, under `taskset -c 0`
+as well. A loop of the same shape
 measures 786 Mmac/s scalar against 18,286 Mmac/s with `vmadot` - 23 times - with
 **different results**, because the MAC unit at VLEN=128 and SEW=8 is 2x2x4[x2]
 and the operands have to be packed the way the example's `Gemm_packB` does.
