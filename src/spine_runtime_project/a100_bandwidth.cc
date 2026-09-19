@@ -289,6 +289,8 @@ uint64_t host_checksum_gemv(const uint8_t* data, uint64_t bytes, uint32_t passes
 }
 
 #ifdef HAVE_RVV
+static uint8_t* allocate(size_t bytes, bool* huge);
+
 /* Layout probe for vmadot on this cluster.
  *
  * The IME specification pins the operand *shapes* down (Copies*(M,K) in vs1,
@@ -356,14 +358,32 @@ static int ime_layout_probe(spert::Stream& stream, const uint32_t cores)
      * ones, tiles 16-31 do the same for B. With a single 1 in one operand the
      * product is 0 or 1 per accumulator, so each tile reports which of the eight
      * C slots answered - the whole layout in one result vector. */
-    std::vector<uint8_t> buffer(32 * 32, 0);
-    std::vector<uint64_t> out(32 * 16, 0);
+    /* Both buffers are page-aligned mappings rather than vector storage: the
+     * probe still reports free(): invalid next size at exit after printing its
+     * mapping, and a mapping that the runtime cannot corrupt into the heap is
+     * worth more than a diagnosis of which allocator boundary it crosses. */
+    bool huge = false;
+    uint8_t* buffer = allocate(32 * 32, &huge);
+    uint8_t* out_bytes = allocate(32 * 16 * sizeof(uint64_t), &huge);
+    uint64_t* out = reinterpret_cast<uint64_t*>(out_bytes);
+
+    if (buffer == nullptr || out_bytes == nullptr)
+        return 1;
+    std::memset(buffer, 0, 32 * 32);
+    std::memset(out_bytes, 0, 32 * 16 * sizeof(uint64_t));
+    std::fprintf(stderr, "ime-layout: buffers are page-aligned mappings\n");
 
     for (int tile = 0; tile < 32; ++tile) {
-        uint8_t* slice = buffer.data() + tile * 32;
+        uint8_t* slice = buffer + tile * 32;
         int position = tile % 16;
 
-        std::memset(slice, 1, 32);
+        /* Distinctive values: the untouched operand carries 1..16 by position, so
+         * every C value that comes back names the position it paired with instead
+         * of only saying "something answered". */
+        for (int index = 0; index < 16; ++index) {
+            slice[index] = (uint8_t)(index + 1);
+            slice[16 + index] = (uint8_t)(index + 1);
+        }
         if (tile < 16) {
             for (int index = 0; index < 16; ++index)
                 slice[index] = 0;
@@ -377,8 +397,8 @@ static int ime_layout_probe(spert::Stream& stream, const uint32_t cores)
     std::fprintf(stderr, "ime-layout: one launch, grid %u (the granted core count)\n",
                  cores);
     std::fprintf(stderr, "ime-layout: A and B are 16 bytes each; values are 0 or 1\n");
-    auto future = stream.launch(spert::Grid(cores), probe_kernel, buffer.data(), (uint64_t)1024,
-                                1u, out.data());
+    auto future = stream.launch(spert::Grid(cores), probe_kernel, buffer, (uint64_t)1024,
+                                1u, out);
 
     if (!future.valid()) {
         std::fprintf(stderr, "ime-layout: launch refused\n");

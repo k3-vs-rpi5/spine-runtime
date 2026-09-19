@@ -253,6 +253,22 @@ record: the process still reports `free(): invalid next size` at exit after
 printing the mapping, so the mapping is valid while the allocation discipline
 around it is not yet settled.
 
+Two changes then settled what could be settled. The probe's buffers are now
+page-aligned mappings rather than vector storage, and the exit-time allocator
+complaint disappeared - recorded as isolation, not as a diagnosis, since whether
+the runtime writes past the buffer or crosses an allocator boundary is still
+unknown. And the untouched operand now carries 1..16 by position, so a C value
+names the position it paired with: in every A case one C slot carries a small
+value that tracks the A position (2, 5, 7, 9, 11, ...), the large constants
+(1496, 2992) are sums over many lanes, and the constant changes between A
+positions 11 and 12 - the copy structure is real and asymmetric, as the
+specification's sliding-packing note implies.
+
+The full permutation is still not written down, and no rate is quoted until it
+is: turning the pairing signal into a packing routine needs a deliberate solve
+(single 1 in both operands over (p,q), reading back which C slot answers), not
+another reading of the table.
+
 ## Workspace entry
 
 ```xml
