@@ -631,6 +631,40 @@ therefore accepted on: every `RESULT` line present, every `checksum=ok`, and
 `a100_probe` healthy either side. The process exit status is not a usable success
 signal here until that defect is found.
 
+### The decode kernel is source, not a black box
+
+`spacemit_kernels::ime2::gemm_kernel_i8i4_m1` is in the pinned fork, not only in the
+prebuilt library: `ggml/src/ggml-cpu/spacemit/ime2_kernels.cpp` of
+`projects/llama.cpp/src/llama.cpp`, dispatched by `gemm_kernel_i8i4` -
+`count_m >= 4` takes the `_m4` kernel, everything else `_m1`. Its own comments give
+the two formats:
+
+| side | per k-block | bytes |
+|---|---|---|
+| A, activations, 1 row, int8 | `fp32 scale | int16 asum | 32 x int8` | 38 |
+| B, weights, 32 columns, int4 | `32 x fp16 scale | 32 columns x 16 bytes` | 576 |
+
+and its inner loop, per k-block: `vl4r.v` (512 bytes of weights), `vle8.v` (64 bytes
+of scales), `vle8.v` (32 bytes of activations), two `vnpack4.vv`, eight MACs
+(`vmadotsu.hp` / `vmadotu.hp`), three `vpack.vv`, `vfwmul.vv`, `vfmacc.vf` - about
+two dozen vector instructions for 614 bytes, accumulating in fp32 in `v2`.
+
+Two things follow. The family measured above is the family this kernel runs, so the
+2.4x between 9.0 and 22.7 GiB/s is not instruction availability, not the format and
+not the memory path; and the probe's byte accounting is confirmed correct for it
+(18 bytes per column per block is exactly the B side of that table). What is left
+as the cause is the per-call work and the per-block dependency chain: decode makes
+3,956 `_m1` calls per token, each looping over column groups of at most 32 (the
+kernel's own outer step), and each k-block inside them is eight dependent MACs into
+four accumulators followed by three packs and two conversions before the fp32 FMA.
+The call shapes themselves - how many columns and how many k-blocks each call
+carries - are not yet measured, and they are what decides between those two.
+
+That makes `ime2_kernels.cpp` the landing place for a kernel-level optimization,
+and it makes the prerequisite concrete: a build path for the pinned fork, so that a
+one-variable change there can be built for the board and measured against this
+baseline instead of against the vendor's prebuilt library.
+
 ## Workspace entry
 
 ```xml
