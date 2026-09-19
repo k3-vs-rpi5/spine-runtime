@@ -232,6 +232,70 @@ void read_kernel_decode_shape(spert::Context* context, const uint8_t* data, uint
     out[tile] = accumulator;
 }
 
+/* The same 608-byte unit and the same order as `d608vec`, written with RVV
+ * intrinsics so the compiler schedules the loads and the accumulation. The
+ * hand-written version measured its own pipeline breaks (three inline-assembly
+ * blocks per unit, one `vsetvli` each, 15.0 GiB/s); this one exists to find out
+ * whether the gap to the flat walk (25.4-26.0 GiB/s) is the unit size and the
+ * load shape or only the hand-written kernel's structure. */
+void read_kernel_608_intrinsic(spert::Context* context, const uint8_t* data, uint64_t bytes,
+                               uint32_t passes, uint64_t* out) {
+    const uint32_t tile = context->program_id(0);
+    const uint32_t tiles = context->grid_dim(0);
+    constexpr uint64_t kUnit = 608;
+    const uint64_t count = bytes / kUnit;
+    uint64_t accumulator = 0;
+    /* SEW 64 with a fractional LMUL is not a legal vtype (SEW/LMUL must stay at
+     * least 8), so the 64- and 32-byte parts use m1 with a smaller vl - the
+     * second time in this exercise that the format's shape had to be spelled the
+     * way the hardware allows rather than the way it reads. */
+    const size_t vl_w = 512 / sizeof(uint64_t);
+    const size_t vl_s = 64 / sizeof(uint64_t);
+    const size_t vl_z = 32 / sizeof(uint64_t);
+    vuint64m4_t acc_w;
+    vuint64m1_t acc_s;
+    vuint64m1_t acc_z;
+
+    if (count == 0) {
+        out[tile] = 0;
+        return;
+    }
+    acc_w = __riscv_vmv_v_x_u64m4(0, vl_w);
+    acc_s = __riscv_vmv_v_x_u64m1(0, vl_s);
+    acc_z = __riscv_vmv_v_x_u64m1(0, vl_z);
+    for (uint32_t pass = 0; pass < passes; ++pass) {
+        for (uint64_t index = tile; index < count; index += tiles) {
+            const uint8_t* block = data + index * kUnit;
+            const vuint64m4_t w =
+                __riscv_vle64_v_u64m4(reinterpret_cast<const uint64_t*>(block), vl_w);
+            const vuint64m1_t s = __riscv_vle64_v_u64m1(
+                reinterpret_cast<const uint64_t*>(block + 512), vl_s);
+            const vuint64m1_t z = __riscv_vle64_v_u64m1(
+                reinterpret_cast<const uint64_t*>(block + 576), vl_z);
+
+            acc_w = __riscv_vadd_vv_u64m4(acc_w, w, vl_w);
+            acc_s = __riscv_vadd_vv_u64m1(acc_s, s, vl_s);
+            acc_z = __riscv_vadd_vv_u64m1(acc_z, z, vl_z);
+        }
+        {
+            vuint64m1_t zero = __riscv_vmv_v_x_u64m1(0, 1);
+            vuint64m1_t total = __riscv_vredsum_vs_u64m4_u64m1(acc_w, zero, vl_w);
+
+            accumulator += __riscv_vmv_x_s_u64m1_u64(total);
+            zero = __riscv_vmv_v_x_u64m1(0, 1);
+            total = __riscv_vredsum_vs_u64m1_u64m1(acc_s, zero, vl_s);
+            accumulator += __riscv_vmv_x_s_u64m1_u64(total);
+            zero = __riscv_vmv_v_x_u64m1(0, 1);
+            total = __riscv_vredsum_vs_u64m1_u64m1(acc_z, zero, vl_z);
+            accumulator += __riscv_vmv_x_s_u64m1_u64(total);
+        }
+        acc_w = __riscv_vmv_v_x_u64m4(0, vl_w);
+        acc_s = __riscv_vmv_v_x_u64m1(0, vl_s);
+        acc_z = __riscv_vmv_v_x_u64m1(0, vl_z);
+    }
+    out[tile] = accumulator;
+}
+
 /* The decode format's own read granularity, done the way the decode kernel does it:
  * one 512-byte multi-register load, one 64-byte load and one 32-byte load per
  * 608-byte k-block, all vector, with the units visited in the backend's ascending
@@ -1447,6 +1511,7 @@ int main(int argc, char** argv) {
         {"decode608", read_kernel_decode_shape, kind::tiled},
         {"t608seq", read_kernel_608_sequential, kind::tiled},
         {"d608vec", read_kernel_608_vector, kind::d608},
+        {"d608int", read_kernel_608_intrinsic, kind::d608},
         /* the same packed read, serving 1, 4 and 8 rows from one pass over it */
         {"gemvR1", read_kernel_gemv<1>, kind::gemv1},
         {"gemvR4", read_kernel_gemv<4>, kind::gemv4},
