@@ -389,9 +389,15 @@ void probe_kernel(spert::Context* context, const uint8_t* data, uint64_t bytes,
     /* The grid is the granted core count, which is the only shape this runtime
      * has accepted so far (grid 1 spun, grid 32 faulted, grid == cores works in
      * every other kernel here), so each tile walks four of the 32 cases. */
-    for (int step = 0; step < 4; ++step) {
-        const uint32_t tile_case = tile * 4 + (uint32_t)step;
-        const uint8_t* slice = data + (uint64_t)tile_case * 32;
+    /* Register assignment follows the specification rather than convenience: with
+     * VLEN=128 and LMUL=1 a register is 16 bytes, and the integer form takes A
+     * from VS1 *and* VS1+1 while B sits in VS2. The first probe loaded A into v0
+     * and B into v1, so the instruction read its second A register out of the B
+     * data - which is what made the (p,q) table look sparse and asymmetric. Each
+     * case is therefore 64 bytes: A at 0..31, B at 32..47. */
+    for (int step = 0; step < 64; ++step) {
+        const uint32_t tile_case = tile * 64 + (uint32_t)step;
+        const uint8_t* slice = data + (uint64_t)tile_case * 64;
         /* C occupies two sequential vector registers (the specification's even-vd
          * rule), so a case needs 16 int32 - two copies of a 2x2 int32 tile at
          * VLEN=128 - and the mask goes after them, not inside them. The first
@@ -406,12 +412,14 @@ void probe_kernel(spert::Context* context, const uint8_t* data, uint64_t bytes,
             "vle32.v v28, (%[ACC])       \n\t"
             "vsetvli t0, zero, e8, m1    \n\t"
             "vle8.v  v0, (%[A])          \n\t"
-            "vle8.v  v1, (%[B])          \n\t"
-            "vmadot  v28, v0, v1         \n\t"
+            "vle8.v  v1, (%[A2])         \n\t"
+            "vle8.v  v2, (%[B])          \n\t"
+            "vmadot  v28, v0, v2         \n\t"
             "vsetvli t0, zero, e32, m2   \n\t"
             "vse32.v v28, (%[ACC])       \n\t"
-            : : [A] "r"(slice), [B] "r"(slice + 16), [ACC] "r"(acc)
-            : "cc", "t0", "v0", "v1", "v28", "memory");
+            : : [A] "r"(slice), [A2] "r"(slice + 16), [B] "r"(slice + 32),
+                [ACC] "r"(acc)
+            : "cc", "t0", "v0", "v1", "v2", "v28", "memory");
         {
             uint64_t mask = 0;
 
@@ -435,14 +443,14 @@ static int ime_layout_probe(spert::Stream& stream, const uint32_t cores)
      * mapping, and a mapping that the runtime cannot corrupt into the heap is
      * worth more than a diagnosis of which allocator boundary it crosses. */
     bool huge = false;
-    uint8_t* buffer = allocate(256 * 32, &huge);
-    uint8_t* out_bytes = allocate(256 * 16 * sizeof(uint64_t), &huge);
+    uint8_t* buffer = allocate(512 * 64, &huge);
+    uint8_t* out_bytes = allocate(512 * 16 * sizeof(uint64_t), &huge);
     uint64_t* out = reinterpret_cast<uint64_t*>(out_bytes);
 
     if (buffer == nullptr || out_bytes == nullptr)
         return 1;
-    std::memset(buffer, 0, 256 * 32);
-    std::memset(out_bytes, 0, 256 * 16 * sizeof(uint64_t));
+    std::memset(buffer, 0, 512 * 64);
+    std::memset(out_bytes, 0, 512 * 16 * sizeof(uint64_t));
     std::fprintf(stderr, "ime-layout: buffers are page-aligned mappings\n");
 
     /* One 1 in A and one in B per case, over all 16x16 combinations: two positions
@@ -450,18 +458,18 @@ static int ime_layout_probe(spert::Stream& stream, const uint32_t cores)
      * (p,q) pairs partition the positions into k-classes, and the C slot that
      * answers names the (row, column) each position carries. That is the whole
      * packing question, asked in one launch. */
-    for (int tile_case = 0; tile_case < 256; ++tile_case) {
-        uint8_t* slice = buffer + tile_case * 32;
-        const int p = tile_case / 16;
-        const int q = tile_case % 16;
+    for (int tile_case = 0; tile_case < 512; ++tile_case) {
+        uint8_t* slice = buffer + tile_case * 64;
+        const int p = tile_case / 16;      /* A position 0..31 across v0, v1 */
+        const int q = tile_case % 16;      /* B position 0..15 inside v2 */
 
-        std::memset(slice, 0, 32);
+        std::memset(slice, 0, 64);
         slice[p] = 1;
-        slice[16 + q] = 1;
+        slice[32 + q] = 1;
     }
     std::fprintf(stderr, "ime-layout: one launch, grid %u (the granted core count)\n",
                  cores);
-    std::fprintf(stderr, "ime-layout: A and B are 16 bytes each; 256 single-1 cases\n");
+    std::fprintf(stderr, "ime-layout: A is 32 bytes (v0,v1), B is 16 (v2); 512 cases\n");
     auto future = stream.launch(spert::Grid(cores), probe_kernel, buffer, (uint64_t)8192,
                                 1u, out);
 
@@ -471,9 +479,11 @@ static int ime_layout_probe(spert::Stream& stream, const uint32_t cores)
     }
     std::fprintf(stderr, "ime-layout: launched, waiting for sync\n");
     future.sync();
-    std::fprintf(stderr, "ime-layout: synced; p q -> copy0 copy1\n");
-    for (int tile = 0; tile < 256; ++tile) {
+    std::fprintf(stderr, "ime-layout: synced; only the cases that answer are printed\n");
+    for (int tile = 0; tile < 512; ++tile) {
         const uint64_t mask = out[tile * 16 + 8];
+        if (!mask)
+            continue;
         const int32_t* acc = reinterpret_cast<const int32_t*>(&out[tile * 16]);
         const int32_t* acc2 = acc + 8;
 

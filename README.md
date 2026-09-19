@@ -307,6 +307,26 @@ What remains for the A100 own-kernel route is a pairing solve with a B window wi
 enough to hold every partner of every A position, then the packing routine, then
 the rate at R=1, 2 and 4 against the vendor's 9.0 and 5.8 GiB/s.
 
+### That solve fixes the operand size and shows the layout is a broadcast
+
+Run as described - 64-byte cases with A across two registers and B in a third, a
+single 1 in each operand, 512 combinations - the answers refute the assumption the
+widened window was built on and settle the operand sizes:
+
+- **A is one register, not two.** A positions 16..31 never answer, so at VLEN=128
+  and SEW=8 an instruction consumes 16 bytes of A and 16 of B - exactly the
+  specification's 2x2x4 with Copies=2 at this vector length.
+- **The operand is broadcast, not mapped one-to-one.** Every A position pairs with
+  nearly every B position, and the lit C slots form a small set (`{0,2,6}`, `{2,6}`)
+  rather than one slot per pair: a byte is slid across several MAC lanes, which is
+  what "sliding-packing" means and why a packing written from the prose is wrong.
+
+Two routes to the packing remain, both concrete: fit the layout from a known GEMM
+by comparing an all-ones run against candidate layouts, or - shorter - disassemble
+the vendor's own i8i4 kernels in the board's `libllama-bench-impl.so`, which are
+the code that actually feeds this silicon at 9.0 GiB/s. No rate is claimed until one
+of them lands.
+
 ## Workspace entry
 
 ```xml
