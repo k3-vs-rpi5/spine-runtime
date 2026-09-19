@@ -24,6 +24,21 @@ vector length and architecture id. The `spacemit-k3` backend targets the AI
 cores 8-15 with a 384 KiB per-core buffer; `spacemit-k3-x100` is a compatible
 mode on the X100 cores and `generic/qemu` is for functional validation only.
 
+## Public material
+
+The runtime does not stop at its headers. Published, and checked here:
+
+| what | where |
+|---|---|
+| documentation set, English and Chinese | `README.md`, `README_ZH.md`, `docs/api-reference(_ZH).md`, `docs/programming-model*`, `docs/scheduling*`, `docs/backends*` |
+| worked example | `examples/quickstart/` (`demo.cpp`, `CMakeLists.txt`, README in both languages) |
+| releases carrying SDK assets | `0.6.0` (3 assets), `0.6.1` (2), `0.6.2` (2 - the SDK this project pins) |
+| the AI cluster's instruction set | `spacemit-com/docs-ai`, `en|zh/architecture/ime_extension.md`: `Zvvm_spacemit` profile v0.6, "Status: Public Release", 2026-04-13; cloned in this workspace at `.local/docs-ai` (commit `2b3894e`) |
+
+The instruction-set document is the one that decides kernel work: it defines the
+matrix family the vendor's own decode kernel runs, block-scaled path included, with
+semantics and formal encodings. See the correction at the end of this file.
+
 ## Status
 
 - documentation repository and SDK identity synced; the SDK stays a sealed
@@ -390,6 +405,9 @@ left open rather than taken.
 
 ### A finer look corrects that: the decode kernel runs instruction families we cannot assemble
 
+> Refuted the same day: those families are public `smt.*`, and this toolchain
+> assembles them. See the correction at the end of this file.
+
 The paragraph above said the vendor uses "ordinary RVV". Counting the instructions
 objdump could not decode - it renders them `.insn 4, 0x...`, which a mnemonic
 search does not see - corrects it. The library holds 494 such instructions, and
@@ -416,6 +434,10 @@ does not use. Recorded, with the vendor-kernel facts and the np=4 / lockstep
 guidance unchanged.
 
 ### A round over the public material: the decode kernel's families are not published
+
+> Refuted the same day: the vendor's own `docs-ai` architecture chapter documents
+> them, and this toolchain decodes and assembles them. See the correction at the
+> end of this file.
 
 Checked, in order:
 
@@ -461,14 +483,72 @@ With that, every public option on this cluster is measured:
 | `smt.vmadot*` (spec, funct7 0x71) | runs | 2,012-2,730 MiB/s | 9,000 (`i8i4_m1`) |
 | `sf.vqmacc.*` (0x5b) | **traps** | - | - |
 | plain RVV | runs | 2,730 MiB/s (`pack4`) | - |
-| the decode kernel's own families (0x21/0x33/0x66/0x6A/0x6B) | runs (their code) | not assemblable here | 9,000 |
+| the decode kernel's own families (0x21/0x33/0x66/0x6A/0x6B) | runs (their code) | **public `smt.*`, assembled here byte-identically** | 9,000 |
 
-So an own-kernel implementation cannot compete from public material alone: the
-family designed for it traps, the one that runs is 4.5 times behind, and the one
-that achieves 9,000 MiB/s has no public assembler. The A100 parallel-decode
-guidance is unchanged (np=4 as the knee, lockstep rather than the server, the
-four-row chunking as the vendor's), and revisiting the kernel question needs vendor
-material for those five `funct7` families.
+So the family designed for this job, `sf.vqmacc`, traps on the silicon, and the RVV
+kernels written here are 4.5 times behind. The third clause recorded here - that
+the 9,000 MiB/s family has no public assembler - is refuted below. The A100
+parallel-decode guidance is unchanged (np=4 as the knee, lockstep rather than the
+server, the four-row chunking as the vendor's).
+
+### Correction: the decode kernel's families are public `smt.*`, and this toolchain assembles them
+
+Two sections above are wrong, for two separate reasons, and the fix is worth more
+than the error was.
+
+**The disassembler was told not to decode them.** This toolchain's RISC-V
+disassembler gates each opcode behind an architecture string, which it takes from
+the ELF attributes of the file it is disassembling. The vendor library advertises
+`Tag_RISCV_arch: "rv64i2p1_..._zvl128b1p0"` with no vendor extension, so every one
+of its vendor instructions printed as `.insn 4, 0x...`. `-M max` - "disassemble
+without checking architecture string" - removes the gate, and the number of
+undecoded words goes to **zero**:
+
+| mnemonic | count in `libggml-cpu.so.0.16.0` |
+|---|---|
+| `smt.vpack.vv` | 150 |
+| `smt.vmadot` | 144 |
+| `smt.vupack.vv` | 50 |
+| `smt.vmadotsu.hp` | 48 |
+| `smt.vmadotu.hp` | 32 |
+| `smt.vmadotsu` | 28 |
+| `smt.vmadot.hp` | 16 |
+| `smt.vnpack4.vv` | 14 |
+| `smt.vmadotu` | 12 |
+
+494 is exactly the number that had been counted as undecodable, so the five
+"families" tabulated by `funct7` were this one public instruction set, unread.
+
+**The assembler test used the wrong operand form.** The `.hp` forms take five
+operands plus a data-type suffix (`vd, vs1, vs2, v0/v1, imm3, i4|i8`), the packing
+forms four (`vd, vs1, vs2, imm2`); the earlier check tried three. Written the way
+the vendor's own disassembly prints them, this toolchain emits the vendor's words
+byte for byte:
+
+| the vendor's leaf | this toolchain |
+|---|---|
+| `d645082b` `smt.vmadotsu.hp v16,v10,v4,v1,0,i4` | identical |
+| `cc44082b` `smt.vmadotu.hp v16,v8,v4,v0,0,i4` | identical |
+| `67281c2b` `smt.vpack.vv v24,v16,v18,1` | identical |
+| `4231b42b` `smt.vnpack4.vv v8,v3,v3,3` | identical |
+
+And the third reason, the one that should have stopped the earlier round before it
+started: the vendor's public `docs-ai` tree documents the whole family, and has been
+cloned in this workspace since 2026-09-17. `en/architecture/ime_extension.md` is the
+`Zvvm_spacemit` profile, version 0.6, "Status: Public Release", 2026-04-13; chapter
+5.4 defines `smt.vmadot.hp*` as the block-quantization path `C <- (A x B) x S + C`
+with FP16/BF16 scales, chapter 8.4 gives formal encodings whose fields reproduce
+`0xd645082b` by hand, and the register constraint the assembler enforces (`v0`/`v1`)
+is the specification's own.
+
+That makes the vendor's decode kernel readable as what it is: `vnpack4` packs the
+4-bit weights, `vmadotsu.hp`/`vmadotu.hp` multiply Int4 and Int8 tiles against FP16
+block scales and accumulate into FP16, and `vpack` interleaves the accumulators.
+The 4.5x gap is now a re-implementation task with the right instructions in hand,
+not a route that waits on vendor material. `sf.vqmacc.*` still traps on this silicon
+and stays out. The next measurement is one launch per core whose only work is
+`smt.vmadotsu.hp`, checked against a host reference the way the `vmadot` and
+`sf.vqmacc` probes were.
 
 ## Workspace entry
 
