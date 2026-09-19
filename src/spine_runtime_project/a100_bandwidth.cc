@@ -347,26 +347,30 @@ void probe_sfq_kernel(spert::Context* context, const uint8_t* data, uint64_t byt
  * decode kernel runs, in the operand form the specification gives
  * (`vd, vs1, vs2, v0/v1, imm3, i4`) and the assembler enforces (`v0`/`v1` only).
  *
- * The tile spans more registers than the prose states, so the probe makes the
- * answer layout-independent instead of guessing the extent: every vector register
- * carries the same nibble pattern (0x1111, so every Int4 product is 1x1), the
- * scale register carries FP16 1.0 in every lane, and the accumulators start at
- * zero. Summed over K = 32 that is 32.0 = 0x5000 in every FP16 output lane,
- * whichever lanes the instruction actually writes. A trap shows up the way
- * `sf.vqmacc` did: a launch that never returns.
+ * The tile geometry is the specification's: for the scale-enabled family the
+ * A100 profile fixes lambda = 8, MUL_C = 1 and SEW = 16, so 8x32x8 Int4 is 128
+ * bytes per operand and the 8x8 accumulator is one register of 64 FP16 lanes.
+ * The operands are uniform (every nibble 1), the scale register is FP16 1.0 in
+ * every lane and the accumulator starts at zero, so every output lane is 32
+ * products of 1x1 times 1.0 = 32.0 = 0x5000, whatever order the tile lays itself
+ * out in. A trap shows up the way `sf.vqmacc` did: a launch that never returns.
  */
 void probe_smthp_kernel(spert::Context* context, const uint8_t* data, uint64_t bytes,
                         uint32_t passes, uint64_t* out) {
     const uint32_t tile = context->program_id(0);
-    /* v24 and v25 are the FP16 destination pair the specification's Copies rule
-     * allows at VLEN=128; both are stored, so a two-register tile is observed
-     * rather than assumed away. */
-    /* Windows start after the 1 KiB flat area the control kernel also writes,
-     * so the two addressing conventions cannot overwrite each other. */
-    uint16_t* acc = reinterpret_cast<uint16_t*>(out + 128 + (uint64_t)tile * 32);
+    /* One 512-byte window per tile, after the 1 KiB flat area the control kernel
+     * also writes: 128 bytes of result, then vlenb and the scalar id, then the
+     * tile id as a vector store - which is 128 bytes wide, one register, and
+     * overruns anything smaller. */
+    uint8_t* window = reinterpret_cast<uint8_t*>(out + 128 + (uint64_t)tile * 64);
+    uint64_t vlenb = 0;
 
     (void)bytes;
     (void)passes;
+    /* Read in its own asm block: as an output of the block below, the compiler
+     * may hand it a register an input pointer already uses, and it is written
+     * first, which sends the stores to whatever that pointer's bits say. */
+    __asm__ volatile("csrr %0, vlenb" : "=r"(vlenb));
     __asm__ volatile(
         "vsetvli t0, zero, e16, m1, tu, mu   \n\t"
         "vle16.v v16, (%[ONES])              \n\t"
@@ -400,29 +404,25 @@ void probe_smthp_kernel(spert::Context* context, const uint8_t* data, uint64_t b
         "vmv.v.v v31, v16                    \n\t"
         "vle16.v v0, (%[SCALE])              \n\t"
         "vmv.v.i v24, 0                      \n\t"
-        "vmv.v.i v25, 0                      \n\t"
         "vmv.v.x v31, %[TILE]                \n\t"
         "smt.vmadotsu.hp v24,v16,v16,v0,0,i4 \n\t"
         "vse16.v v24, (%[ACC])               \n\t"
         /* The store above is deliberately issued with no fresh vsetvli, and the
-         * ones below are issued after one: if the matrix instruction leaves the
-         * vector unit in a state a plain store cannot use, that shows up as the
-         * first region empty and the rest full. */
+         * one below after one: if the matrix instruction leaves the vector unit
+         * in a state a plain store cannot use, that shows up as the result region
+         * empty and the id written. */
         "vsetvli t0, zero, e16, m1, tu, mu   \n\t"
-        "vse16.v v25, (%[ACC2])              \n\t"
         /* the tile id, written by plain RVV: a core whose stores do not land is
          * then visibly different from a core whose instruction result is zero */
         "vse16.v v31, (%[ID])                \n\t"
-        : : [ONES] "r"(data + 16), [SCALE] "r"(data), [ACC] "r"(acc),
-            [ACC2] "r"(acc + 8), [ID] "r"(acc + 16), [TILE] "r"(tile)
+        : : [ONES] "r"(data + 128), [SCALE] "r"(data), [ACC] "r"(window),
+          [ID] "r"(window + 256), [TILE] "r"(tile)
         : "cc", "t0", "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8",
           "v9", "v10", "v11", "v12", "v13", "v14", "v15", "v16", "v17", "v18",
           "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28",
           "v29", "v30", "v31", "memory");
-    /* And the same tile id again as a plain 64-bit scalar store, the shape every
-     * other kernel in this file uses: that separates "the core did not run" from
-     * "the vector store did not land". */
-    out[(uint64_t)tile * 32 + 24] = 0x1000ull + tile;
+    std::memcpy(window + 128, &vlenb, sizeof(vlenb));
+    *(reinterpret_cast<uint64_t*>(window + 136)) = 0x1000ull + tile;
 }
 
 /* The control for `--smthp`: the same launch, the same buffers and the same
@@ -432,18 +432,21 @@ void probe_smthp_kernel(spert::Context* context, const uint8_t* data, uint64_t b
 void probe_smthp_control_kernel(spert::Context* context, const uint8_t* data,
                                 uint64_t bytes, uint32_t passes, uint64_t* out) {
     const uint32_t tile = context->program_id(0);
-    uint16_t* acc = reinterpret_cast<uint16_t*>(out + 128 + (uint64_t)tile * 32);
+    uint8_t* window = reinterpret_cast<uint8_t*>(out + 128 + (uint64_t)tile * 64);
+    uint64_t vlenb = 0;
 
     (void)data;
     (void)bytes;
     (void)passes;
+    __asm__ volatile("csrr %0, vlenb" : "=r"(vlenb));
     __asm__ volatile(
         "vsetvli t0, zero, e16, m1, tu, mu \n\t"
         "vmv.v.x v24, %[TILE]              \n\t"
         "vse16.v v24, (%[ACC])             \n\t"
-        : : [ACC] "r"(acc), [TILE] "r"(tile)
+        : : [ACC] "r"(window + 256), [TILE] "r"(tile)
         : "cc", "t0", "v24", "memory");
-    out[(uint64_t)tile * 32 + 24] = 0x2000ull + tile;
+    std::memcpy(window + 128, &vlenb, sizeof(vlenb));
+    *(reinterpret_cast<uint64_t*>(window + 136)) = 0x2000ull + tile;
     /* The addressing convention every other kernel in this file uses and the
      * `a100_probe` validates per tile: one uint64 per tile, no window. */
     out[tile] = 0x3000ull + tile;
@@ -956,12 +959,12 @@ int main(int argc, char** argv) {
          * up as a failed launch; a value means the silicon implements it. */
         bool huge = false;
         uint8_t* inputs = allocate(32, &huge);
-        uint8_t* results = allocate(1024 + cores * 32 * sizeof(uint64_t), &huge);
+        uint8_t* results = allocate(1024 + cores * 64 * sizeof(uint64_t), &huge);
 
         if (inputs == nullptr || results == nullptr)
             return 1;
         std::memset(inputs, 1, 32);
-        std::memset(results, 0, 1024 + cores * 32 * sizeof(uint64_t));
+        std::memset(results, 0, 1024 + cores * 64 * sizeof(uint64_t));
         std::fprintf(stderr, "sfqmac: launching one sf.vqmacc.4x8x4 per core\n");
         auto attempt = stream.launch(spert::Grid(cores), probe_sfq_kernel, inputs, (uint64_t)32,
                                      1u, reinterpret_cast<uint64_t*>(results));
@@ -985,20 +988,20 @@ int main(int argc, char** argv) {
          * answer does not depend on the tile extent: 32 products of 1x1, scaled by
          * FP16 1.0, is 32.0 = 0x5000 in every FP16 lane. */
         bool huge = false;
-        uint8_t* inputs = allocate(32, &huge);
-        uint8_t* results = allocate(cores * 16 * sizeof(uint64_t), &huge);
+        /* 128 bytes of scale - one register of FP16 lanes at VLEN=1024 - and 128
+         * bytes of nibble-packed operands, which is 8x32 Int4 exactly. */
+        uint8_t* inputs = allocate(256, &huge);
+        uint8_t* results = allocate(1024 + cores * 32 * sizeof(uint64_t), &huge);
 
         if (inputs == nullptr || results == nullptr)
             return 1;
-        for (int index = 0; index < 8; ++index) { /* scale: FP16 1.0, all lanes */
+        for (int index = 0; index < 64; ++index) { /* scale: FP16 1.0, all lanes */
             inputs[index * 2 + 0] = 0x00;
             inputs[index * 2 + 1] = 0x3c;
         }
-        for (int index = 0; index < 8; ++index) { /* operands: every nibble is 1 */
-            inputs[16 + index * 2 + 0] = 0x11;
-            inputs[16 + index * 2 + 1] = 0x11;
-        }
-        std::memset(results, 0, cores * 16 * sizeof(uint64_t));
+        for (int index = 0; index < 128; ++index) /* operands: every nibble is 1 */
+            inputs[128 + index] = 0x11;
+        std::memset(results, 0, 1024 + cores * 32 * sizeof(uint64_t));
         std::fprintf(stderr, "smthp: launching %s per core\n",
                      smthp_control ? "the control kernel (no matrix instruction)"
                                    : "one smt.vmadotsu.hp");
@@ -1024,22 +1027,30 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "\n");
         }
         for (uint32_t tile = 0; tile < cores; ++tile) {
-            const uint16_t* lanes =
-                reinterpret_cast<const uint16_t*>(results + 1024 + tile * 256);
-            const uint64_t scalar =
-                reinterpret_cast<const uint64_t*>(results + tile * 256)[24];
+            const uint8_t* window = results + 1024 + (uint64_t)tile * 512;
+            const uint16_t* lanes = reinterpret_cast<const uint16_t*>(window);
+            const uint16_t* ids =
+                reinterpret_cast<const uint16_t*>(window + 256);
+            uint64_t vlenb = 0;
+            uint64_t id = 0;
+            int nonzero = 0;
 
-            std::fprintf(stderr, "  core %u: v24", tile);
+            std::memcpy(&vlenb, window + 128, sizeof(vlenb));
+            std::memcpy(&id, window + 136, sizeof(id));
+            for (int index = 0; index < 64; ++index)
+                if (lanes[index] != 0)
+                    nonzero++;
+            std::fprintf(stderr, "  core %u: vlenb=%llu id=0x%llx lanes[0..7]",
+                         tile, static_cast<unsigned long long>(vlenb),
+                         static_cast<unsigned long long>(id));
             for (int index = 0; index < 8; ++index)
                 std::fprintf(stderr, " 0x%04x", lanes[index]);
-            std::fprintf(stderr, "  v25");
-            for (int index = 0; index < 8; ++index)
-                std::fprintf(stderr, " 0x%04x", lanes[8 + index]);
-            std::fprintf(stderr, "  tile-id");
-            for (int index = 0; index < 8; ++index)
-                std::fprintf(stderr, " 0x%04x", lanes[16 + index]);
-            std::fprintf(stderr, "  scalar=0x%llx\n",
-                         static_cast<unsigned long long>(scalar));
+            std::fprintf(stderr, " tail[56..63]");
+            for (int index = 56; index < 64; ++index)
+                std::fprintf(stderr, " 0x%04x", lanes[index]);
+            std::fprintf(stderr, " idv[0..3] 0x%04x 0x%04x 0x%04x 0x%04x"
+                                 " nonzero=%d/64\n",
+                         ids[0], ids[1], ids[2], ids[3], nonzero);
         }
         return 0;
     }

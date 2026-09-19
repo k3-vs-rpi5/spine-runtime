@@ -556,26 +556,44 @@ buffer. Uniform inputs make the answer independent of the tile extent: every
 nibble of both operands is 1 and the scale register holds FP16 1.0 in every lane,
 so each output lane is 32 products of 1x1 times 1.0 = 32.0 = `0x5000`.
 
-| kernel | per core, `v24` lane 0 |
+| kernel | per core |
 |---|---|
-| `--smthpctl`, the control: same launch and buffers, no matrix instruction | each core's own tile id, `0x0000`-`0x0007` |
-| `--smthp` | **`0x5000` on all eight cores** |
+| `--smthpctl`, the control: same launch and buffers, no matrix instruction | its own tile id written and read back per core |
+| `--smthp` | **`0x5000` in all 64 accumulator lanes on all eight cores** |
 
 So the family the 9,000 MiB/s decode kernel is built from executes on this
-silicon, and it returns the value the published semantics predict. `--smthpctl`
-exists because the first version of this probe reported a scatter that looked like
-a property of the instruction; the control produced the same scatter with no
-matrix instruction in the kernel at all, which made it a defect of the probe's own
-window arithmetic. Every per-core number in this project's probe style now has to
-pass an identity-writing control launch of the same shape first: `a100_probe`'s
-`out[tile]` convention and the layout masks do, and the `--sfqmac` control's
-per-core line is re-opened as unverified - its conclusion, that the family never
-syncs, is untouched.
+silicon, returns the value the published semantics predict, fills the whole tile,
+and leaves the core able to store afterwards.
 
-What remains before a rate can be quoted is the layout: the register extent of the
-8x32x8 Int4 tile at VLEN=128, and how the FP16 scale groups map onto the `imm3`
-field. Both are in the published semantics, so that is a reading and probe-design
-task rather than a request for vendor material.
+### The vector length was being read in the wrong unit
+
+`BackendInfo::vlen` is documented in `spert.hpp` as bytes, and earlier rounds in
+this project read its `128` as bits and reasoned about 16-byte vector registers.
+Measured inside a kernel on the AI cores, `csrr vlenb` returns **128** on all eight
+cores, and the vendor's own instruction-set document fixes the A100 for this
+family at `VLEN = 1024 bits`, `lambda = 8`, `MUL_C = 1`, `SEW = 16`. So a register
+is 128 bytes, 8x32x8 Int4 is one register per operand, and the 8x8 accumulator is
+one register of 64 FP16 lanes. The X100 backend reporting `vlen=32` (32 bytes =
+256 bits, the A60-class core) is the second check on the unit. Every earlier
+statement here that turned the A100's tile into "two 16-byte registers" or a
+"broadcast across registers" is withdrawn; the 64-lane result above is what the
+geometry actually produces.
+
+`--smthpctl` is not decoration: the first version of this probe reported a scatter
+that looked like a property of the instruction, and the control produced the same
+scatter with no matrix instruction in the kernel at all. Three probe defects came
+out of it in order - a 128-byte store against a 256-byte window, and twice an
+inline-asm output register aliasing an input pointer, once sending the stores to
+address 128 and once writing a tile id of `0x0080`. Any per-core number in this
+project's probe style now has to pass an identity-writing control launch of the
+same shape first: `a100_probe`'s `out[tile]` convention and the layout masks do,
+and the `--sfqmac` control's per-core line is re-opened as unverified - its
+conclusion, that the family never syncs, is untouched.
+
+What remains before a rate can be quoted is the kernel rather than the layout:
+nibble packing through `smt.vnpack4.vv`, the `imm3` scale groups, and
+`smt.vpack.vv` for the accumulator interleave, measured against the vendor's
+9,000 MiB/s and our RVV best of 2,012-2,730 MiB/s.
 
 One harness defect measured here is unrelated to the instruction and pre-dates
 this change: `a100_bandwidth 8` (8 MiB) segfaults before printing anything, on
