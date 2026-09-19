@@ -238,6 +238,80 @@ void read_kernel_decode_shape(spert::Context* context, const uint8_t* data, uint
  * blocks per unit, one `vsetvli` each, 15.0 GiB/s); this one exists to find out
  * whether the gap to the flat walk (25.4-26.0 GiB/s) is the unit size and the
  * load shape or only the hand-written kernel's structure. */
+/* The decode's unit size, but with each core owning one contiguous range instead of
+ * alternating with its pair: this is the shape the blocked-columns candidate wants,
+ * so its rate is the ceiling that candidate is aiming at. */
+template <uint64_t TILE>
+void read_kernel_tile_size_blocked(spert::Context* context, const uint8_t* data,
+                                   uint64_t bytes, uint32_t passes, uint64_t* out) {
+    const uint32_t tile = context->program_id(0);
+    const uint32_t tiles = context->grid_dim(0);
+    const uint64_t count = bytes / TILE;
+    const uint64_t per_tile = count / tiles;
+    uint64_t accumulator = 0;
+
+    if (per_tile == 0) {
+        out[tile] = 0;
+        return;
+    }
+    /* The last core takes the remainder as well, or those units would never be
+     * read and the checksum would fail (it did, in the first version). */
+    const uint64_t first = (uint64_t) tile * per_tile;
+    const uint64_t last =
+        (tile + 1 == tiles) ? count : std::min(count, (uint64_t) (tile + 1) * per_tile);
+
+    for (uint32_t pass = 0; pass < passes; ++pass)
+        for (uint64_t index = first; index < last; ++index) {
+            const uint64_t* base = reinterpret_cast<const uint64_t*>(data + index * TILE);
+
+            for (uint64_t word = 0; word < TILE / sizeof(uint64_t); ++word)
+                accumulator += base[word];
+        }
+    out[tile] = accumulator;
+}
+
+/* The same ascending interleaved walk as `tiledseq`, with the tile size as the
+ * variable. The decode path stages 38,912-byte tiles; the harness's fixed 65,792
+ * was inherited from an earlier question. Sweeping the size tells us whether the
+ * decode's residual 12 % is the granularity of its own staging reads. */
+template <uint64_t TILE>
+void read_kernel_tile_size(spert::Context* context, const uint8_t* data, uint64_t bytes,
+                           uint32_t passes, uint64_t* out) {
+    const uint32_t tile = context->program_id(0);
+    const uint32_t tiles = context->grid_dim(0);
+    const uint64_t count = bytes / TILE;
+    uint64_t accumulator = 0;
+
+    if (count == 0) {
+        out[tile] = 0;
+        return;
+    }
+    for (uint32_t pass = 0; pass < passes; ++pass)
+        for (uint64_t index = tile; index < count; index += tiles) {
+            const uint64_t* base = reinterpret_cast<const uint64_t*>(data + index * TILE);
+
+            for (uint64_t word = 0; word < TILE / sizeof(uint64_t); ++word)
+                accumulator += base[word];
+        }
+    out[tile] = accumulator;
+}
+
+/* The host side of each of those, which is the same sum over the same bytes. */
+uint64_t host_checksum_tile_size(const uint8_t* data, uint64_t bytes, uint32_t passes,
+                                 uint64_t tile_bytes) {
+    const uint64_t units = bytes / tile_bytes;
+    const uint64_t words_per_unit = tile_bytes / sizeof(uint64_t);
+    uint64_t total = 0;
+
+    for (uint64_t unit = 0; unit < units; ++unit) {
+        const uint64_t* words = reinterpret_cast<const uint64_t*>(data + unit * tile_bytes);
+
+        for (uint64_t word = 0; word < words_per_unit; ++word)
+            total += words[word];
+    }
+    return total * passes;
+}
+
 void read_kernel_608_intrinsic(spert::Context* context, const uint8_t* data, uint64_t bytes,
                                uint32_t passes, uint64_t* out) {
     const uint32_t tile = context->program_id(0);
@@ -1490,7 +1564,7 @@ int main(int argc, char** argv) {
     using kernel_fn = void (*)(spert::Context*, const uint8_t*, uint64_t, uint32_t,
                                uint64_t*);
     enum class kind { bytes, words, packed, packed_scaled, tiled, gemv1, gemv4, gemv8,
-                      smthp, d608 };
+                      smthp, d608, tilesize };
     const struct {
         const char* name;
         kernel_fn kernel;
@@ -1510,6 +1584,12 @@ int main(int argc, char** argv) {
         {"tiledblk", read_kernel_tiles_blocked, kind::tiled},
         {"decode608", read_kernel_decode_shape, kind::tiled},
         {"t608seq", read_kernel_608_sequential, kind::tiled},
+        {"t8k", read_kernel_tile_size<8192>, kind::tilesize},
+        {"t16k", read_kernel_tile_size<16384>, kind::tilesize},
+        {"t38912", read_kernel_tile_size<38912>, kind::tilesize},
+        {"t64k", read_kernel_tile_size<65536>, kind::tilesize},
+        {"t38912blk", read_kernel_tile_size_blocked<38912>, kind::tilesize},
+        {"t65536blk", read_kernel_tile_size_blocked<65536>, kind::tilesize},
         {"d608vec", read_kernel_608_vector, kind::d608},
         {"d608int", read_kernel_608_intrinsic, kind::d608},
         /* the same packed read, serving 1, 4 and 8 rows from one pass over it */
@@ -1582,6 +1662,20 @@ int main(int argc, char** argv) {
                 expected = host_checksum_smthp(buffer, bytes, passes);
             } else if (variant.how == kind::d608) {
                 expected = host_checksum_608(buffer, bytes, passes);
+            } else if (variant.how == kind::tilesize) {
+                uint64_t tile_bytes = 8192;
+
+                if (std::strcmp(variant.name, "t16k") == 0)
+                    tile_bytes = 16384;
+                else if (std::strcmp(variant.name, "t38912") == 0)
+                    tile_bytes = 38912;
+                else if (std::strcmp(variant.name, "t64k") == 0)
+                    tile_bytes = 65536;
+                else if (std::strcmp(variant.name, "t38912blk") == 0)
+                    tile_bytes = 38912;
+                else if (std::strcmp(variant.name, "t65536blk") == 0)
+                    tile_bytes = 65536;
+                expected = host_checksum_tile_size(buffer, bytes, passes, tile_bytes);
             } else {
                 expected = host_checksum(buffer, bytes, passes);
             }
@@ -1602,6 +1696,21 @@ int main(int argc, char** argv) {
                 moved = static_cast<double>((bytes / kTileBytes) * kTileBytes);
             if (variant.how == kind::d608)
                 moved = static_cast<double>((bytes / 608) * 608);
+            if (variant.how == kind::tilesize) {
+                uint64_t tile_bytes = 8192;
+
+                if (std::strcmp(variant.name, "t16k") == 0)
+                    tile_bytes = 16384;
+                else if (std::strcmp(variant.name, "t38912") == 0)
+                    tile_bytes = 38912;
+                else if (std::strcmp(variant.name, "t64k") == 0)
+                    tile_bytes = 65536;
+                else if (std::strcmp(variant.name, "t38912blk") == 0)
+                    tile_bytes = 38912;
+                else if (std::strcmp(variant.name, "t65536blk") == 0)
+                    tile_bytes = 65536;
+                moved = static_cast<double>((bytes / tile_bytes) * tile_bytes);
+            }
             double mib_per_s = seconds > 0.0 ? moved * passes / kMiB / seconds : 0.0;
             std::printf("%10zu %6s %8u %8u %10.4f %12.1f %s\n", size_mib,
                         variant.name, cores, passes, seconds, mib_per_s,
