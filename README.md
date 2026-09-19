@@ -327,6 +327,37 @@ the vendor's own i8i4 kernels in the board's `libllama-bench-impl.so`, which are
 the code that actually feeds this silicon at 9.0 GiB/s. No rate is claimed until one
 of them lands.
 
+### The second route answers it, and changes the question
+
+The kernels are not in `libllama-bench-impl.so` but in the board's
+`libggml-cpu.so.0.16.0`, which is not stripped and exports
+`spacemit_kernels::ime2::gemm_kernel_i8i4` plus its `_m1` and `_m4` leaves (the
+dispatcher is a stub that picks between them on a row-count threshold, exactly the
+rule the kernel probe saw from outside). Disassembling the decode leaf:
+
+```
+c6850:  vsetvli t0,zero,e8,m1,tu,mu
+c6854:  vl4r.v  v4,(s5)          # segment load of four registers
+c685c:  vsetvli t0,zero,e8,mf2,tu,mu
+c6860:  vle8.v  v30,(s4)
+c687c:  flw     ft0,0(s2)        # the scale
+c683a:  vfcvt.f.x.v v0,v0        # dequantise to float
+c6908:  vfmacc.vf v2,ft0,v31     # floating-point multiply-accumulate
+```
+
+**`vmadot` appears zero times in the whole library**, and the rare-mnemonic
+histogram holds nothing outside the standard RVV and scalar sets. The name `ime2`
+describes the build configuration and the core it targets, not a matrix
+instruction: the vendor reaches 9.0 GiB/s on the AI cluster with hand-written RVV
+that loads 4-bit weights in 64-byte segments, converts them in registers and
+accumulates with `vfmacc`.
+
+That removes the obstacle the last three rounds were chasing, and it says what to
+do instead: write an RVV gemv in the vendor's shape - segmented 4-bit loads,
+in-register dequantisation, `vfmacc` accumulation, four rows per weight read -
+verify it against a scalar reference, and measure it against that 9.0 GiB/s. The
+IME layout work is not on that path any more.
+
 ## Workspace entry
 
 ```xml
