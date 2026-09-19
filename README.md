@@ -235,6 +235,24 @@ unimplemented unit is an illegal instruction, so SEW=4 and SEW=16 variants and a
 accumulator is a host-stack array where the working kernels write only into the
 buffer the launch was given.
 
+Both of those have now been answered by the probe itself. The host-stack
+accumulator was the launch-time segfault: writing C into the buffer the launch was
+given makes the launch complete. The specification's even-`vd` rule then bit once
+more - **C occupies two sequential vector registers**, so a case needs 16 int32 at
+VLEN=128, and the first working version left only one register's worth, which is
+why its masks showed values above 1.
+
+With 32 cases in one launch the mapping is measured, and it is not the naive one:
+inputs of value 1 produce results of 1, 16, 17, 32, 33, 66 and 70, so **the MAC
+consumes the operands in 4-bit lanes** even though the configuration asked for
+`e8` (a byte 0x01 is read as nibbles (1,0), 0x10 as (0,1)). That is exactly why
+the kernel written from the specification's prose produced four wrong answers out
+of four. Interpreting the mapping now needs a designed run with distinctive
+per-position values rather than bring-up work, and one caveat stays in the
+record: the process still reports `free(): invalid next size` at exit after
+printing the mapping, so the mapping is valid while the allocation discipline
+around it is not yet settled.
+
 ## Workspace entry
 
 ```xml

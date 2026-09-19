@@ -305,17 +305,25 @@ uint64_t host_checksum_gemv(const uint8_t* data, uint64_t bytes, uint32_t passes
  * hypothesis, probe as fact. */
 void probe_kernel(spert::Context* context, const uint8_t* data, uint64_t bytes,
                   uint32_t passes, uint64_t* out) {
-    int32_t acc[8] = {0, 0, 0, 0, 0, 0, 0, 0};
     const uint32_t tile = context->program_id(0);
 
     (void)bytes;
     (void)passes;
+    /* The accumulator lives in the buffer the launch was given, not on the host
+     * stack: every kernel in this repository that works writes only into `out`,
+     * and the first probe versions that crashed differed in exactly that way. */
     /* The grid is the granted core count, which is the only shape this runtime
      * has accepted so far (grid 1 spun, grid 32 faulted, grid == cores works in
      * every other kernel here), so each tile walks four of the 32 cases. */
     for (int step = 0; step < 4; ++step) {
         const uint32_t tile_case = tile * 4 + (uint32_t)step;
         const uint8_t* slice = data + (uint64_t)tile_case * 32;
+        /* C occupies two sequential vector registers (the specification's even-vd
+         * rule), so a case needs 16 int32 - two copies of a 2x2 int32 tile at
+         * VLEN=128 - and the mask goes after them, not inside them. The first
+         * version left only one register's worth and the second register's values
+         * landed on the mask. */
+        int32_t* acc = reinterpret_cast<int32_t*>(out + (uint64_t)tile_case * 16);
 
         for (int index = 0; index < 8; ++index)
             acc[index] = 0;
@@ -336,7 +344,8 @@ void probe_kernel(spert::Context* context, const uint8_t* data, uint64_t bytes,
             for (int index = 0; index < 8; ++index)
                 if (acc[index] != 0)
                     mask |= (uint64_t)1 << index;
-            out[tile_case] = mask;
+            /* keep the mask beside the accumulator so the caller can read both */
+            out[tile_case * 16 + 8] = mask;
         }
     }
 }
@@ -348,7 +357,7 @@ static int ime_layout_probe(spert::Stream& stream, const uint32_t cores)
      * product is 0 or 1 per accumulator, so each tile reports which of the eight
      * C slots answered - the whole layout in one result vector. */
     std::vector<uint8_t> buffer(32 * 32, 0);
-    std::vector<uint64_t> out(32, 0);
+    std::vector<uint64_t> out(32 * 16, 0);
 
     for (int tile = 0; tile < 32; ++tile) {
         uint8_t* slice = buffer.data() + tile * 32;
@@ -379,10 +388,17 @@ static int ime_layout_probe(spert::Stream& stream, const uint32_t cores)
     future.sync();
     std::fprintf(stderr, "ime-layout: synced; nonzero C mask per case\n");
     for (int tile = 0; tile < 32; ++tile) {
-        std::fprintf(stderr, "  %s one at %2d -> C mask 0x%02llx%s\n",
+        const uint64_t mask = out[tile * 16 + 8];
+        const int32_t* acc = reinterpret_cast<const int32_t*>(&out[tile * 16]);
+        const int32_t* acc2 = acc + 8;
+
+        std::fprintf(stderr,
+                     "  %s one at %2d -> copy0 [%d %d %d %d %d %d %d %d] "
+                     "copy1 [%d %d %d %d %d %d %d %d] mask 0x%02llx%s\n",
                      tile < 16 ? "A" : "B", tile % 16,
-                     (unsigned long long)out[tile],
-                     out[tile] ? "" : "  (no output)");
+                     acc[0], acc[1], acc[2], acc[3], acc[4], acc[5], acc[6], acc[7],
+                     acc2[0], acc2[1], acc2[2], acc2[3], acc2[4], acc2[5], acc2[6],
+                     acc2[7], (unsigned long long)mask, mask ? "" : "  (no output)");
     }
     return 0;
 }
