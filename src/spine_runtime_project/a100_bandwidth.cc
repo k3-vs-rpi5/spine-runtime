@@ -167,6 +167,117 @@ uint64_t host_checksum_packed_scaled(const uint8_t* data, uint64_t bytes, uint32
  * granularity and working-set size, not the kernel's arithmetic. */
 constexpr uint64_t kTileBytes = 65792;
 
+/* The same 65,792-byte tile walk as `read_kernel_tiles`, but in the order the
+ * decode path actually reads: ascending, not permuted. The permuted variant was
+ * built to defeat the prefetcher, which makes it a pessimistic model of a
+ * workload that walks its tiles in address order; these two separate "how big is
+ * the tile" from "in what order are the tiles visited". */
+/* The decode path's own read shape: per 608-byte block, 512 bytes of packed
+ * weights, 64 bytes of fp16 scales and 32 bytes of zero points, with the blocks
+ * visited in the interleaved order the backend assigns to its threads. This is
+ * what separates "the format's read shape costs something" from "the stream is
+ * already at its ceiling". */
+/* The same ascending interleaved walk, but with 608-byte units - the size of one
+ * k-block of the decode format (512 bytes of weights, 64 of scales, 32 of zero
+ * points). Same bytes, same order, smaller units: this isolates read granularity
+ * from everything else. */
+void read_kernel_608_sequential(spert::Context* context, const uint8_t* data, uint64_t bytes,
+                                uint32_t passes, uint64_t* out) {
+    const uint32_t tile = context->program_id(0);
+    const uint32_t tiles = context->grid_dim(0);
+    constexpr uint64_t kUnit = 608;
+    const uint64_t count = bytes / kUnit;
+    uint64_t accumulator = 0;
+
+    if (count == 0) {
+        out[tile] = 0;
+        return;
+    }
+    for (uint32_t pass = 0; pass < passes; ++pass)
+        for (uint64_t index = tile; index < count; index += tiles) {
+            const uint64_t* base = reinterpret_cast<const uint64_t*>(data + index * kUnit);
+
+            for (uint64_t word = 0; word < kUnit / sizeof(uint64_t); ++word)
+                accumulator += base[word];
+        }
+    out[tile] = accumulator;
+}
+
+void read_kernel_decode_shape(spert::Context* context, const uint8_t* data, uint64_t bytes,
+                              uint32_t passes, uint64_t* out) {
+    const uint32_t tile = context->program_id(0);
+    const uint32_t tiles = context->grid_dim(0);
+    constexpr uint64_t kBlock = 608;
+    const uint64_t count = bytes / kBlock;
+    uint64_t accumulator = 0;
+
+    if (count == 0) {
+        out[tile] = 0;
+        return;
+    }
+    for (uint32_t pass = 0; pass < passes; ++pass)
+        for (uint64_t index = tile; index < count; index += tiles) {
+            const uint8_t* block = data + index * kBlock;
+            const uint64_t* weights = reinterpret_cast<const uint64_t*>(block);
+            const uint64_t* scales = reinterpret_cast<const uint64_t*>(block + 512);
+            const uint64_t* zps = reinterpret_cast<const uint64_t*>(block + 576);
+
+            for (uint64_t word = 0; word < 512 / sizeof(uint64_t); ++word)
+                accumulator += weights[word];
+            for (uint64_t word = 0; word < 64 / sizeof(uint64_t); ++word)
+                accumulator += scales[word];
+            for (uint64_t word = 0; word < 32 / sizeof(uint64_t); ++word)
+                accumulator += zps[word];
+        }
+    out[tile] = accumulator;
+}
+
+void read_kernel_tiles_sequential(spert::Context* context, const uint8_t* data,
+                                  uint64_t bytes, uint32_t passes, uint64_t* out) {
+    const uint32_t tile = context->program_id(0);
+    const uint32_t tiles = context->grid_dim(0);
+    const uint64_t count = bytes / kTileBytes;
+    uint64_t accumulator = 0;
+
+    if (count == 0) {
+        out[tile] = 0;
+        return;
+    }
+    for (uint32_t pass = 0; pass < passes; ++pass)
+        for (uint64_t index = tile; index < count; index += tiles) {
+            const uint64_t* base = reinterpret_cast<const uint64_t*>(data + index * kTileBytes);
+
+            for (uint64_t word = 0; word < kTileBytes / sizeof(uint64_t); ++word)
+                accumulator += base[word];
+        }
+    out[tile] = accumulator;
+}
+
+/* And the same tiles, but each core owning one contiguous range of them, which is
+ * the most sequential assignment available to eight cores. */
+void read_kernel_tiles_blocked(spert::Context* context, const uint8_t* data,
+                               uint64_t bytes, uint32_t passes, uint64_t* out) {
+    const uint32_t tile = context->program_id(0);
+    const uint32_t tiles = context->grid_dim(0);
+    const uint64_t count = bytes / kTileBytes;
+    const uint64_t per_tile = count / tiles;
+    uint64_t accumulator = 0;
+
+    if (per_tile == 0) {
+        out[tile] = 0;
+        return;
+    }
+    for (uint32_t pass = 0; pass < passes; ++pass)
+        for (uint64_t index = (uint64_t)tile * per_tile; index < (uint64_t)(tile + 1) * per_tile;
+             ++index) {
+            const uint64_t* base = reinterpret_cast<const uint64_t*>(data + index * kTileBytes);
+
+            for (uint64_t word = 0; word < kTileBytes / sizeof(uint64_t); ++word)
+                accumulator += base[word];
+        }
+    out[tile] = accumulator;
+}
+
 void read_kernel_tiles(spert::Context* context, const uint8_t* data, uint64_t bytes,
                        uint32_t passes, uint64_t* out) {
     const uint32_t tile = context->program_id(0);
@@ -1207,6 +1318,10 @@ int main(int argc, char** argv) {
         {"smthpnd", read_kernel_smthp_control, kind::smthp},
 #endif
         {"tiled", read_kernel_tiles, kind::tiled},
+        {"tiledseq", read_kernel_tiles_sequential, kind::tiled},
+        {"tiledblk", read_kernel_tiles_blocked, kind::tiled},
+        {"decode608", read_kernel_decode_shape, kind::tiled},
+        {"t608seq", read_kernel_608_sequential, kind::tiled},
         /* the same packed read, serving 1, 4 and 8 rows from one pass over it */
         {"gemvR1", read_kernel_gemv<1>, kind::gemv1},
         {"gemvR4", read_kernel_gemv<4>, kind::gemv4},
