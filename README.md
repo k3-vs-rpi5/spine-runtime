@@ -546,9 +546,41 @@ That makes the vendor's decode kernel readable as what it is: `vnpack4` packs th
 block scales and accumulate into FP16, and `vpack` interleaves the accumulators.
 The 4.5x gap is now a re-implementation task with the right instructions in hand,
 not a route that waits on vendor material. `sf.vqmacc.*` still traps on this silicon
-and stays out. The next measurement is one launch per core whose only work is
-`smt.vmadotsu.hp`, checked against a host reference the way the `vmadot` and
-`sf.vqmacc` probes were.
+and stays out. The next measurement is the one below.
+
+### The vendor's family runs on the A100
+
+`a100_bandwidth --smthp` launches one kernel per core whose entire work is
+`smt.vmadotsu.hp v24,v16,v16,v0,0,i4`, operands and accumulator in the launch
+buffer. Uniform inputs make the answer independent of the tile extent: every
+nibble of both operands is 1 and the scale register holds FP16 1.0 in every lane,
+so each output lane is 32 products of 1x1 times 1.0 = 32.0 = `0x5000`.
+
+| kernel | per core, `v24` lane 0 |
+|---|---|
+| `--smthpctl`, the control: same launch and buffers, no matrix instruction | each core's own tile id, `0x0000`-`0x0007` |
+| `--smthp` | **`0x5000` on all eight cores** |
+
+So the family the 9,000 MiB/s decode kernel is built from executes on this
+silicon, and it returns the value the published semantics predict. `--smthpctl`
+exists because the first version of this probe reported a scatter that looked like
+a property of the instruction; the control produced the same scatter with no
+matrix instruction in the kernel at all, which made it a defect of the probe's own
+window arithmetic. Every per-core number in this project's probe style now has to
+pass an identity-writing control launch of the same shape first: `a100_probe`'s
+`out[tile]` convention and the layout masks do, and the `--sfqmac` control's
+per-core line is re-opened as unverified - its conclusion, that the family never
+syncs, is untouched.
+
+What remains before a rate can be quoted is the layout: the register extent of the
+8x32x8 Int4 tile at VLEN=128, and how the FP16 scale groups map onto the `imm3`
+field. Both are in the published semantics, so that is a reading and probe-design
+task rather than a request for vendor material.
+
+One harness defect measured here is unrelated to the instruction and pre-dates
+this change: `a100_bandwidth 8` (8 MiB) segfaults before printing anything, on
+this revision and on the one before it, while 64 MiB and above complete - so the
+sizes quoted in this file are the larger ones.
 
 ## Workspace entry
 
