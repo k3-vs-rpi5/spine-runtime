@@ -314,6 +314,35 @@ uint64_t host_checksum_gemv(const uint8_t* data, uint64_t bytes, uint32_t passes
 #ifdef HAVE_RVV
 static uint8_t* allocate(size_t bytes, bool* huge);
 
+/* Does this cluster implement the public `sf.vqmacc` family at all?
+ *
+ * The instruction is public in the toolchain (`xsfvqmaccdod` / `xsfvqmaccqoq`,
+ * opcode 0x5b) but has no public semantic documentation, so the first question is
+ * not "what does its layout look like" but "does the silicon execute it": an
+ * unimplemented instruction traps, and a trap here is visible as a failed launch.
+ * One instruction, one accumulator in the launch buffer, no layout assumptions. */
+void probe_sfq_kernel(spert::Context* context, const uint8_t* data, uint64_t bytes,
+                      uint32_t passes, uint64_t* out) {
+    const uint32_t tile = context->program_id(0);
+    int32_t* acc = reinterpret_cast<int32_t*>(out + (uint64_t)tile * 16);
+
+    (void)bytes;
+    (void)passes;
+    for (int index = 0; index < 8; ++index)
+        acc[index] = 0;
+    __asm__ volatile(
+        "vsetvli t0, zero, e32, m2   \n\t"
+        "vle32.v v28, (%[ACC])       \n\t"
+        "vsetvli t0, zero, e8, m1    \n\t"
+        "vle8.v  v0, (%[A])          \n\t"
+        "vle8.v  v1, (%[B])          \n\t"
+        "sf.vqmacc.4x8x4 v28, v0, v1 \n\t"
+        "vsetvli t0, zero, e32, m2   \n\t"
+        "vse32.v v28, (%[ACC])       \n\t"
+        : : [A] "r"(data), [B] "r"(data + 16), [ACC] "r"(acc)
+        : "cc", "t0", "v0", "v1", "v28", "memory");
+}
+
 /* An RVV gemv in the shape the vendor's own kernels use.
  *
  * Disassembling `spacemit_kernels::ime2::gemm_kernel_i8i4_m1` in the board's
@@ -740,6 +769,7 @@ int main(int argc, char** argv) {
      * visible, which a block-buffered stdout does not. */
     std::setvbuf(stderr, nullptr, _IONBF, 0);
     bool layout_probe = false;
+    bool sfq_probe = false;
 
     if (argc == 2 && (std::strcmp(argv[1], "-h") == 0 ||
                       std::strcmp(argv[1], "--help") == 0)) {
@@ -751,6 +781,10 @@ int main(int argc, char** argv) {
 
         if (std::strcmp(argv[index], "--ime-layout") == 0) {
             layout_probe = true;
+            continue;
+        }
+        if (std::strcmp(argv[index], "--sfqmac") == 0) {
+            sfq_probe = true;
             continue;
         }
         if (value <= 0) {
@@ -794,6 +828,35 @@ int main(int argc, char** argv) {
 #ifdef HAVE_RVV
     if (layout_probe)
         return ime_layout_probe(stream, cores);
+    if (sfq_probe) {
+        /* One instruction on every core, then read what came back. A trap shows
+         * up as a failed launch; a value means the silicon implements it. */
+        bool huge = false;
+        uint8_t* inputs = allocate(32, &huge);
+        uint8_t* results = allocate(cores * 16 * sizeof(uint64_t), &huge);
+
+        if (inputs == nullptr || results == nullptr)
+            return 1;
+        std::memset(inputs, 1, 32);
+        std::memset(results, 0, cores * 16 * sizeof(uint64_t));
+        std::fprintf(stderr, "sfqmac: launching one sf.vqmacc.4x8x4 per core\n");
+        auto attempt = stream.launch(spert::Grid(cores), probe_sfq_kernel, inputs, (uint64_t)32,
+                                     1u, reinterpret_cast<uint64_t*>(results));
+
+        if (!attempt.valid()) {
+            std::fprintf(stderr, "sfqmac: launch refused\n");
+            return 1;
+        }
+        attempt.sync();
+        std::fprintf(stderr, "sfqmac: synced\n");
+        for (uint32_t tile = 0; tile < cores; ++tile) {
+            const int32_t* acc = reinterpret_cast<const int32_t*>(results + tile * 128);
+
+            std::fprintf(stderr, "  core %u: [%d %d %d %d %d %d %d %d]\n", tile,
+                         acc[0], acc[1], acc[2], acc[3], acc[4], acc[5], acc[6], acc[7]);
+        }
+        return 0;
+    }
 #endif
 
     using kernel_fn = void (*)(spert::Context*, const uint8_t*, uint64_t, uint32_t,

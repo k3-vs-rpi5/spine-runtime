@@ -43,7 +43,7 @@ echo "== build the A100 probe (riscv64) =="
 # vector-without-IME2 all complete 3 to 4 of 5 - see README "The A100 ISA flag
 # and the kernels we submit" for the whole matrix. SPERT_A100_FLAGS overrides it
 # for a re-measurement.
-A100_FLAGS=${SPERT_A100_FLAGS:--march=rv64imafdcv_zicsr_zifencei_zba_zbb_zbs_xsmtvdotii -mtune=spacemit-a100}
+A100_FLAGS=${SPERT_A100_FLAGS:--march=rv64imafdcv_zicsr_zifencei_zba_zbb_zbs_xsmtvdotii_xsfvqmaccdod_xsfvqmaccqoq -mtune=spacemit-a100}
 if ! "$CXX" $A100_FLAGS -E - </dev/null >/dev/null 2>&1; then
     echo "toolchain does not accept $A100_FLAGS; the bandwidth numbers would be scalar" >&2
     exit 1

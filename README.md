@@ -439,6 +439,37 @@ instruction family available in this workspace that is designed for the same job
 which makes it the one own-kernel experiment still worth running before the route
 is closed.
 
+### That family traps on the A100, which closes the route
+
+`a100_bandwidth --sfqmac` launches one kernel per core whose only work is the
+instruction in question, accumulator in the launch buffer, nothing else assumed:
+
+| instruction | result |
+|---|---|
+| `sf.vqmacc.4x8x4 v28, v0, v1` | the launch never returns - no `synced`, no values, the process dies; the cluster stays healthy (`a100_probe`: `kernels=ok mismatches=0 us_per_launch=29.2`) |
+| `vmadot v28, v0, v1` (same path, one instruction swapped) | completes, `[16 0 0 0 0 0 0 0]` on every core |
+
+The control is what makes it a statement about the instruction: identical launch
+path, buffers, grid and reading code; one instruction syncs, the other never does.
+That is an illegal instruction on the AI cores - binutils encodes the extension,
+the silicon does not implement it, and the runtime does not surface the trap.
+
+With that, every public option on this cluster is measured:
+
+| family | on the A100 | our best | vendor |
+|---|---|---|---|
+| `smt.vmadot*` (spec, funct7 0x71) | runs | 2,012-2,730 MiB/s | 9,000 (`i8i4_m1`) |
+| `sf.vqmacc.*` (0x5b) | **traps** | - | - |
+| plain RVV | runs | 2,730 MiB/s (`pack4`) | - |
+| the decode kernel's own families (0x21/0x33/0x66/0x6A/0x6B) | runs (their code) | not assemblable here | 9,000 |
+
+So an own-kernel implementation cannot compete from public material alone: the
+family designed for it traps, the one that runs is 4.5 times behind, and the one
+that achieves 9,000 MiB/s has no public assembler. The A100 parallel-decode
+guidance is unchanged (np=4 as the knee, lockstep rather than the server, the
+four-row chunking as the vendor's), and revisiting the kernel question needs vendor
+material for those five `funct7` families.
+
 ## Workspace entry
 
 ```xml
