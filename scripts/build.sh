@@ -26,11 +26,20 @@ STAGE=${SPERT_STAGE:-$WORKSPACE/.local/spine-runtime/stage}
 mkdir -p "$OUT" "$STAGE"
 
 echo "== build the A100 probe (riscv64) =="
-"$CXX" --sysroot="$TOOLCHAIN/sysroot" -O2 -std=c++17 -Wall \
+# The kernels these binaries submit run on the AI cluster, so they have to be
+# compiled for it: without an A100 flag the toolchain emits plain rv64gc code and
+# the microbenchmark measures the scalar issue rate of one core instead of the
+# cluster's memory path. Measured by comparing the same sweep both ways.
+A100_FLAGS=${SPERT_A100_FLAGS:--mcpu=spacemit-a100}
+if ! "$CXX" $A100_FLAGS -E - </dev/null >/dev/null 2>&1; then
+    echo "toolchain does not accept $A100_FLAGS; the bandwidth numbers would be scalar" >&2
+    exit 1
+fi
+"$CXX" --sysroot="$TOOLCHAIN/sysroot" -O2 -std=c++17 -Wall $A100_FLAGS \
     -I"$ROOT/src" -I"$SDK/include" -I"$TCM/include" \
     -o "$OUT/a100_probe" "$ROOT/src/spine_runtime_project/a100_probe.cc" \
     -L"$SDK/lib" -lspert -Wl,-rpath,'$ORIGIN' -pthread
-"$CXX" --sysroot="$TOOLCHAIN/sysroot" -O2 -std=c++17 -Wall \
+"$CXX" --sysroot="$TOOLCHAIN/sysroot" -O2 -std=c++17 -Wall $A100_FLAGS \
     -I"$ROOT/src" -I"$SDK/include" -I"$TCM/include" \
     -o "$OUT/a100_bandwidth" "$ROOT/src/spine_runtime_project/a100_bandwidth.cc" \
     -L"$SDK/lib" -lspert -Wl,-rpath,'$ORIGIN' -pthread
