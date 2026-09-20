@@ -210,8 +210,6 @@ void run_q6_full(spert::Stream& stream) {
         uint8_t* bb = b.data() + blk * kQ6Bytes;
 
         for (size_t col = 0; col < kCols; col++) {
-            const size_t base = blk * 256;
-
             *reinterpret_cast<uint16_t*>(bb + kQ6Scales + kQ6Qs + kQ6Qh + col * 2) =
                 (uint16_t) (0x3c00 | (col & 1));   /* fp16 near 1.0, column-dependent */
             for (size_t kii = 0; kii < 16; kii++)

@@ -60,15 +60,20 @@ fi
 # built when that stage exists: it answers a question about the kernels' operand
 # pairing, not about the runtime.
 LLAMA_STAGE_DIR=${SPERT_LLAMA_STAGE:-$WORKSPACE/.local/llama.cpp/stage}
-if [ -f "$LLAMA_STAGE_DIR/bin/libggml-cpu.so" ]; then
+# The probe needs a llama.cpp stage that carries the compact q6_K kernel, which is
+# only true while patch 0023 is applied; without it the symbols do not exist.
+if [ -f "$LLAMA_STAGE_DIR/bin/libggml-cpu.so" ] &&
+   "$TOOLCHAIN/bin/riscv64-unknown-linux-gnu-nm" -D "$LLAMA_STAGE_DIR/bin/libggml-cpu.so.0.16.0" 2>/dev/null |
+       grep -q gemm_kernel_i8i6k_m1; then
     "$CXX" --sysroot="$TOOLCHAIN/sysroot" -O2 -std=c++17 -Wall $A100_FLAGS \
         -I"$ROOT/src" -I"$SDK/include" -I"$TCM/include" \
         -o "$OUT/probe_layout" "$ROOT/src/spine_runtime_project/probe_layout.cc" \
         -L"$SDK/lib" -lspert -Wl,-rpath,'$ORIGIN' -pthread \
         -L"$LLAMA_STAGE_DIR/bin" -lggml-cpu -Wl,-rpath-link,"$LLAMA_STAGE_DIR/bin"
-    cp "$OUT/probe_layout" "$STAGE/probe_layout"
-    chmod +x "$STAGE/probe_layout"
-    printf "  %-14s %s bytes\n" probe_layout "$(stat -c%s "$STAGE/probe_layout")"
+    # Built, not staged: its dependency libggml-cpu.so.0 belongs to the llama.cpp
+    # payload, so delivering it here would put a foreign library in this board's
+    # payload. A board that runs the probe gets both stages on its library path.
+    printf "  %-14s %s bytes (build only)\n" probe_layout "$(stat -c%s "$OUT/probe_layout")"
 fi
 "$CXX" -print-file-name=libstdc++.so.6 >/dev/null
 cp "$OUT/a100_probe" "$STAGE/a100_probe"
