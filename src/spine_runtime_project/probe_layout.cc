@@ -271,6 +271,66 @@ void run_q6_full(spert::Stream& stream) {
     std::printf("q6full worst_abs_diff=%.3f   col0 kernel=%.2f host=%.2f\n", worst, out[0], host0);
 }
 
+/* Which output column consumes which scale lane. Every value is 1 and every scale is
+ * 1 except one, so the column that doubles names the pairing. */
+void run_q6_scale(spert::Stream& stream, const char* name, size_t scale_lane) {
+    constexpr size_t kBlocks = 1;
+    std::vector<uint8_t> a(kQ6A * kBlocks, 0);
+    std::vector<uint8_t> b(kQ6Bytes * kBlocks, 0);
+    std::vector<float>   out(kCols, -1.0f);
+
+    for (size_t blk = 0; blk < kBlocks; blk++) {
+        uint8_t* ab = a.data() + blk * kQ6A;
+
+        *reinterpret_cast<float*>(ab)       = 1.0f;
+        *reinterpret_cast<int16_t*>(ab + 4) = 0;
+        for (size_t i = 0; i < 256; i++)
+            reinterpret_cast<int8_t*>(ab + 4 + 2 * 16)[i] = 1;
+    }
+
+    for (size_t col = 0; col < kCols; col++) {
+        *reinterpret_cast<uint16_t*>(b.data() + kQ6Scales + kQ6Qs + kQ6Qh + col * 2) = 0x3c00;
+        for (size_t kii = 0; kii < 16; kii++)
+            reinterpret_cast<int8_t*>(b.data())[kii * kCols + col] = (col == scale_lane) ? 2 : 1;
+    }
+
+    for (size_t k64 = 0; k64 < 4; k64++) {
+        for (size_t sb = 0; sb < 4; sb++) {
+            for (size_t b16 = 0; b16 < 16; b16++) {
+                for (size_t col = 0; col < kCols; col++) {
+                    const uint8_t v = 1;
+
+                    if (sb % 2 == 0) {
+                        b[kQ6Scales + ((k64 * 2 + sb / 2) * kCols + col) * 16 + b16] |= (uint8_t) (v & 0x0F);
+                    } else {
+                        b[kQ6Scales + ((k64 * 2 + sb / 2) * kCols + col) * 16 + b16] |=
+                            (uint8_t) ((v & 0x0F) << 4);
+                    }
+                }
+            }
+        }
+    }
+
+    auto future = stream.launch(spert::Grid{1}, [](spert::Context* context, const uint8_t* a_ptr,
+                                                   const uint8_t* b_ptr, float* c_ptr) {
+        (void) context;
+        spacemit_kernels::ime2::gemm_kernel_i8i6k_m1(256, a_ptr, b_ptr, b_ptr, c_ptr, 1, kCols,
+                                                     kBlocks, kCols);
+    }, a.data(), b.data(), out.data());
+
+    if (!future.valid()) {
+        std::printf("RESULT q6scale=%s launch=refused\n", name);
+        return;
+    }
+    future.sync();
+
+    std::printf("q6scale %-18s lane %2zu doubled ->", name, scale_lane);
+    for (size_t col = 0; col < kCols; col++)
+        if (out[col] < -7936.5f)
+            std::printf(" col %zu", col);
+    std::printf("   (ref -7936, doubled -15872)\n");
+}
+
 }  // namespace
 
 int main() {
@@ -305,6 +365,11 @@ int main() {
         run_one(stream, c);
     run_q6(stream, "col0 k0 value1", 0, 0, 1);
     run_q6(stream, "col0 k1 value1", 0, 1, 1);
+    run_q6(stream, "col0 k0 value16", 0, 0, 16);
+    run_q6(stream, "col0 k1 value16", 0, 1, 16);
+    run_q6(stream, "col0 k0 value32", 0, 0, 32);
+    run_q6(stream, "col0 k16 value48", 0, 16, 48);
+    run_q6(stream, "col0 k0 value63", 0, 0, 63);
     run_q6(stream, "col0 k16 value1", 0, 16, 1);
     run_q6(stream, "col0 k16 value2", 0, 16, 2);
     run_q6(stream, "col1 k0 value1", 1, 0, 1);
@@ -312,5 +377,10 @@ int main() {
     run_q6(stream, "col0 k256 value1", 0, 256, 1);
     run_q6(stream, "col3 k300 value5", 3, 300, 5);
     run_q6_full(stream);
+    for (size_t lane = 0; lane < 4; lane++) {
+        char name[32];
+        std::snprintf(name, sizeof(name), "lane%zu", lane);
+        run_q6_scale(stream, name, lane);
+    }
     return 0;
 }
