@@ -335,6 +335,60 @@ void run_q6_scale(spert::Stream& stream, const char* name, size_t scale_lane) {
 /* Which K16 sub-block a scale group belongs to. Values are all 1 and scales all 1
  * except for one sub-block, so the output shifts by -31 x sum(A over that sub-block's
  * slice): 4216 / 12152 / 20088 / 28024 for sub-blocks 0 / 1 / 2 / 3 with A[i] = i+1. */
+/* Two non-zero values at once: the smallest case that has values differing across
+ * positions, which is what the random comparison says is required to fail. */
+void run_q6_pair(spert::Stream& stream, const char* name, size_t k1, uint8_t v1, size_t k2, uint8_t v2) {
+    constexpr size_t kBlocks = 1;
+    std::vector<uint8_t> a(kQ6A * kBlocks, 0);
+    std::vector<uint8_t> b(kQ6Bytes * kBlocks, 0);
+    std::vector<float>   out(kCols, -1.0f);
+    int8_t               avec[256];
+
+    *reinterpret_cast<float*>(a.data())       = 1.0f;
+    *reinterpret_cast<int16_t*>(a.data() + 4) = 0;
+    for (size_t i = 0; i < 256; i++) {
+        avec[i] = static_cast<int8_t>((i % 100) + 1);
+        reinterpret_cast<int8_t*>(a.data() + 4 + 2 * 16)[i] = avec[i];
+    }
+    for (size_t col = 0; col < kCols; col++) {
+        *reinterpret_cast<uint16_t*>(b.data() + kQ6Scales + kQ6Qs + kQ6Qh + col * 2) = 0x3c00;
+        for (size_t kii = 0; kii < 16; kii++)
+            reinterpret_cast<int8_t*>(b.data())[kii * kCols + col] = 1;
+    }
+    const size_t where[2] = { k1, k2 };
+    const uint8_t vals[2] = { v1, v2 };
+    for (int which = 0; which < 2; which++) {
+        const size_t kk  = where[which];
+        const size_t k64 = kk / 64;
+        const size_t sb  = (kk % 64) / 16;
+        const size_t b16 = kk % 16;
+        const size_t off = kQ6Scales + ((k64 * 2 + sb / 2) * kCols + 0) * 16 + b16;
+
+        if (sb % 2 == 0) {
+            b[off] |= (uint8_t) (vals[which] & 0x0F);
+        } else {
+            b[off] |= (uint8_t) ((vals[which] & 0x0F) << 4);
+        }
+        b[kQ6Scales + kQ6Qs + (k64 * kCols + 0) * 16 + b16] |=
+            (uint8_t) (((vals[which] >> 4) & 3) << (2 * sb));
+    }
+
+    auto future = stream.launch(spert::Grid{1}, [kBlocks](spert::Context* context, const uint8_t* a_ptr,
+                                                          const uint8_t* b_ptr, float* c_ptr) {
+        (void) context;
+        spacemit_kernels::ime2::gemm_kernel_i8i6k_m1(256, a_ptr, b_ptr, b_ptr, c_ptr, 1, kCols,
+                                                     kBlocks, kCols);
+    }, a.data(), b.data(), out.data());
+    if (!future.valid()) { std::printf("RESULT q6pair launch=refused\n"); return; }
+    future.sync();
+
+    double baseline = 0.0;
+    for (size_t i = 0; i < 256; i++) baseline += (double) avec[i] * -32.0;
+    const double expected = baseline + (double) v1 * avec[k1] + (double) v2 * avec[k2];
+    std::printf("q6pair %-14s kernel_col0=%.1f host=%.1f diff=%.1f\n", name, out[0], expected,
+                (double) out[0] - expected);
+}
+
 void run_q6_scale_k(spert::Stream& stream, size_t doubled_kii) {
     constexpr size_t kBlocks = 1;
     std::vector<uint8_t> a(kQ6A * kBlocks, 0);
@@ -455,5 +509,50 @@ int main() {
     }
     for (size_t kii = 0; kii < 5; kii++)
         run_q6_scale_k(stream, kii);
+    run_q6_pair(stream, "same K16", 0, 5, 1, 7);
+    run_q6_pair(stream, "k0+k16", 0, 5, 16, 7);
+    run_q6_pair(stream, "k0+k64", 0, 5, 64, 7);
+    run_q6_pair(stream, "k0+k7", 0, 5, 7, 7);
+
+    /* Two columns with different values at the same K index: the last untested axis. */
+    {
+        constexpr size_t kBlocks = 1;
+        std::vector<uint8_t> a(kQ6A * kBlocks, 0);
+        std::vector<uint8_t> b(kQ6Bytes * kBlocks, 0);
+        std::vector<float>   out(kCols, -1.0f);
+        int8_t               avec[256];
+
+        *reinterpret_cast<float*>(a.data())       = 1.0f;
+        *reinterpret_cast<int16_t*>(a.data() + 4) = 0;
+        for (size_t i = 0; i < 256; i++) {
+            avec[i] = static_cast<int8_t>((i % 100) + 1);
+            reinterpret_cast<int8_t*>(a.data() + 4 + 2 * 16)[i] = avec[i];
+        }
+        for (size_t col = 0; col < kCols; col++) {
+            *reinterpret_cast<uint16_t*>(b.data() + kQ6Scales + kQ6Qs + kQ6Qh + col * 2) = 0x3c00;
+            for (size_t kii = 0; kii < 16; kii++)
+                reinterpret_cast<int8_t*>(b.data())[kii * kCols + col] = 1;
+        }
+        /* column 0 value 5 at K0, column 1 value 7 at K0 */
+        b[kQ6Scales + 0 * 16 + 0] |= 5;
+        b[kQ6Scales + 1 * 16 + 0] |= 7;
+        *reinterpret_cast<uint16_t*>(b.data() + kQ6Scales + kQ6Qs + kQ6Qh + 0 * 2) = 0x3c00;
+
+        auto future = stream.launch(spert::Grid{1}, [kBlocks](spert::Context* context,
+                                                             const uint8_t* a_ptr, const uint8_t* b_ptr,
+                                                             float* c_ptr) {
+            (void) context;
+            spacemit_kernels::ime2::gemm_kernel_i8i6k_m1(256, a_ptr, b_ptr, b_ptr, c_ptr, 1, kCols,
+                                                         kBlocks, kCols);
+        }, a.data(), b.data(), out.data());
+        future.sync();
+
+        double baseline = 0.0;
+        for (size_t i = 0; i < 256; i++) baseline += (double) avec[i] * -32.0;
+        const double e0 = baseline + 5.0 * avec[0];
+        const double e1 = baseline + 7.0 * avec[0];
+        std::printf("q6cols col0 kernel=%.1f host=%.1f   col1 kernel=%.1f host=%.1f\n", out[0], e0,
+                    out[1], e1);
+    }
     return 0;
 }
