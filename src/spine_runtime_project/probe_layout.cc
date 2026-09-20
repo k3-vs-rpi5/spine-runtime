@@ -172,7 +172,7 @@ void run_q6(spert::Stream& stream, const char* name, size_t column, size_t k_ind
 /* The whole thing at the real size: K = 2048 (eight superblocks), random values and
  * random activations, against a host-side reference of the same operand bytes. A
  * degenerate single-value case cannot catch a plane or pointer mistake; this can. */
-void run_q6_full(spert::Stream& stream, size_t kBlocks) {
+void run_q6_full(spert::Stream& stream, size_t kBlocks, bool signed_a) {
     const size_t kK = 256 * kBlocks;
     std::vector<uint8_t> a(kQ6A * kBlocks, 0);
     std::vector<uint8_t> b(kQ6Bytes * kBlocks, 0);
@@ -186,7 +186,8 @@ void run_q6_full(spert::Stream& stream, size_t kBlocks) {
     unsigned seed = 12345u;
 
     for (size_t i = 0; i < kK; i++)
-        avec[i] = static_cast<int8_t>((int) (next(seed) % 255) - 127);
+        avec[i] = signed_a ? static_cast<int8_t>((int) (next(seed) % 255) - 127)
+                           : static_cast<int8_t>((int) (next(seed) % 127) + 1);
 
     for (size_t col = 0; col < kCols; col++) {
         d[col] = static_cast<float>((int) (next(seed) % 100) + 1) / 100.0f;
@@ -267,8 +268,8 @@ void run_q6_full(spert::Stream& stream, size_t kBlocks) {
         if (diff > worst)
             worst = (float) diff;
     }
-    std::printf("q6full blocks=%zu worst_abs_diff=%.3f   col0 kernel=%.2f host=%.2f\n", kBlocks, worst,
-                out[0], host0);
+    std::printf("q6full blocks=%zu signed_a=%d worst_abs_diff=%.3f   col0 kernel=%.2f host=%.2f\n",
+                kBlocks, (int) signed_a, worst, out[0], host0);
 }
 
 /* Which output column consumes which scale lane. Every value is 1 and every scale is
@@ -331,6 +332,75 @@ void run_q6_scale(spert::Stream& stream, const char* name, size_t scale_lane) {
     std::printf("   (ref -7936, doubled -15872)\n");
 }
 
+/* Which K16 sub-block a scale group belongs to. Values are all 1 and scales all 1
+ * except for one sub-block, so the output shifts by -31 x sum(A over that sub-block's
+ * slice): 4216 / 12152 / 20088 / 28024 for sub-blocks 0 / 1 / 2 / 3 with A[i] = i+1. */
+void run_q6_scale_k(spert::Stream& stream, size_t doubled_kii) {
+    constexpr size_t kBlocks = 1;
+    std::vector<uint8_t> a(kQ6A * kBlocks, 0);
+    std::vector<uint8_t> b(kQ6Bytes * kBlocks, 0);
+    std::vector<float>   out(kCols, 0.0f);
+
+    for (size_t blk = 0; blk < kBlocks; blk++) {
+        uint8_t* ab = a.data() + blk * kQ6A;
+
+        *reinterpret_cast<float*>(ab)       = 1.0f;
+        *reinterpret_cast<int16_t*>(ab + 4) = 0;
+        for (size_t i = 0; i < 256; i++)
+            reinterpret_cast<int8_t*>(ab + 4 + 2 * 16)[i] = static_cast<int8_t>((i % 100) + 1);
+    }
+
+    for (size_t col = 0; col < kCols; col++) {
+        *reinterpret_cast<uint16_t*>(b.data() + kQ6Scales + kQ6Qs + kQ6Qh + col * 2) = 0x3c00;
+        for (size_t kii = 0; kii < 16; kii++)
+            reinterpret_cast<int8_t*>(b.data())[kii * kCols + col] = (kii == doubled_kii) ? 2 : 1;
+    }
+
+    for (size_t k64 = 0; k64 < 4; k64++) {
+        for (size_t sb = 0; sb < 4; sb++) {
+            for (size_t b16 = 0; b16 < 16; b16++) {
+                for (size_t col = 0; col < kCols; col++) {
+                    if (sb % 2 == 0) {
+                        b[kQ6Scales + ((k64 * 2 + sb / 2) * kCols + col) * 16 + b16] |= 0x01;
+                    } else {
+                        b[kQ6Scales + ((k64 * 2 + sb / 2) * kCols + col) * 16 + b16] |= 0x10;
+                    }
+                }
+            }
+        }
+    }
+
+    auto future = stream.launch(spert::Grid{1}, [kBlocks](spert::Context* context, const uint8_t* a_ptr,
+                                                          const uint8_t* b_ptr, float* c_ptr) {
+        (void) context;
+        spacemit_kernels::ime2::gemm_kernel_i8i6k_m1(256, a_ptr, b_ptr, b_ptr, c_ptr, 1, kCols,
+                                                     kBlocks, kCols);
+    }, a.data(), b.data(), out.data());
+
+    if (!future.valid()) {
+        std::printf("RESULT q6scaleK launch=refused\n");
+        return;
+    }
+    future.sync();
+
+    /* baseline with every scale 1: -31 * sum(A) over 256 values */
+    double sum_a = 0.0;
+    for (size_t i = 0; i < 256; i++)
+        sum_a += (double) ((i % 100) + 1);
+    const double baseline = -31.0 * sum_a;
+    const double deltas[4] = { -31.0 * 136.0, -31.0 * 392.0, -31.0 * 648.0, -31.0 * 904.0 };
+    const double observed = (double) out[0] - baseline;
+    int          matched  = -1;
+
+    for (int j = 0; j < 4; j++) {
+        if (std::fabs(deltas[j] - observed) < 0.5)
+            matched = j;
+    }
+    std::printf("q6scaleK doubled kii=%2zu  observed_delta=%.1f  matches A slice of sub-block %d"
+                "   (expected deltas 4216 12152 20088 28024)\n",
+                doubled_kii, observed, matched);
+}
+
 }  // namespace
 
 int main() {
@@ -376,12 +446,14 @@ int main() {
     run_q6(stream, "col0 k32 value1", 0, 32, 1);
     run_q6(stream, "col0 k256 value1", 0, 256, 1);
     run_q6(stream, "col3 k300 value5", 3, 300, 5);
-    run_q6_full(stream, 1);
-    run_q6_full(stream, 8);
+    run_q6_full(stream, 1, false);
+    run_q6_full(stream, 1, true);
     for (size_t lane = 0; lane < 4; lane++) {
         char name[32];
         std::snprintf(name, sizeof(name), "lane%zu", lane);
         run_q6_scale(stream, name, lane);
     }
+    for (size_t kii = 0; kii < 5; kii++)
+        run_q6_scale_k(stream, kii);
     return 0;
 }
