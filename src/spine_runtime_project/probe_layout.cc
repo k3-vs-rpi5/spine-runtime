@@ -172,7 +172,7 @@ void run_q6(spert::Stream& stream, const char* name, size_t column, size_t k_ind
 /* The whole thing at the real size: K = 2048 (eight superblocks), random values and
  * random activations, against a host-side reference of the same operand bytes. A
  * degenerate single-value case cannot catch a plane or pointer mistake; this can. */
-void run_q6_full(spert::Stream& stream, size_t kBlocks, bool signed_a) {
+void run_q6_full(spert::Stream& stream, size_t kBlocks, bool signed_a, unsigned value_mask = 0x3Fu) {
     const size_t kK = 256 * kBlocks;
     std::vector<uint8_t> a(kQ6A * kBlocks, 0);
     std::vector<uint8_t> b(kQ6Bytes * kBlocks, 0);
@@ -194,7 +194,7 @@ void run_q6_full(spert::Stream& stream, size_t kBlocks, bool signed_a) {
         for (size_t kii = 0; kii < kK / 16; kii++)
             scales[col * (kK / 16) + kii] = static_cast<int8_t>((int) (next(seed) % 31) - 15);
         for (size_t k = 0; k < kK; k++)
-            values[col * kK + k] = static_cast<uint8_t>(next(seed) & 0x3F);
+            values[col * kK + k] = static_cast<uint8_t>(next(seed) & value_mask);
     }
 
     for (size_t blk = 0; blk < kBlocks; blk++) {
@@ -267,8 +267,8 @@ void run_q6_full(spert::Stream& stream, size_t kBlocks, bool signed_a) {
         if (diff > worst)
             worst = (float) diff;
     }
-    std::printf("q6full blocks=%zu signed_a=%d worst_abs_diff=%.3f   col0 kernel=%.2f host=%.2f\n",
-                kBlocks, (int) signed_a, worst, out[0], host0);
+    std::printf("q6full blocks=%zu signed_a=%d mask=0x%02X worst_abs_diff=%.3f   col0 kernel=%.2f host=%.2f\n",
+                kBlocks, (int) signed_a, value_mask, worst, out[0], host0);
 }
 
 /* Which output column consumes which scale lane. Every value is 1 and every scale is
@@ -501,6 +501,8 @@ int main() {
     run_q6(stream, "col3 k300 value5", 3, 300, 5);
     run_q6_full(stream, 1, false);
     run_q6_full(stream, 1, true);
+    run_q6_full(stream, 1, true, 0x0Fu);
+    run_q6_full(stream, 1, true, 0x30u);
     for (size_t lane = 0; lane < 4; lane++) {
         char name[32];
         std::snprintf(name, sizeof(name), "lane%zu", lane);
