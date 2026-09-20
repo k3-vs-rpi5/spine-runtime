@@ -172,9 +172,8 @@ void run_q6(spert::Stream& stream, const char* name, size_t column, size_t k_ind
 /* The whole thing at the real size: K = 2048 (eight superblocks), random values and
  * random activations, against a host-side reference of the same operand bytes. A
  * degenerate single-value case cannot catch a plane or pointer mistake; this can. */
-void run_q6_full(spert::Stream& stream) {
-    constexpr size_t kBlocks = 8;
-    constexpr size_t kK      = 256 * kBlocks;
+void run_q6_full(spert::Stream& stream, size_t kBlocks) {
+    const size_t kK = 256 * kBlocks;
     std::vector<uint8_t> a(kQ6A * kBlocks, 0);
     std::vector<uint8_t> b(kQ6Bytes * kBlocks, 0);
     std::vector<float>   out(kCols, 0.0f);
@@ -239,8 +238,8 @@ void run_q6_full(spert::Stream& stream) {
         }
     }
 
-    auto future = stream.launch(spert::Grid{1}, [](spert::Context* context, const uint8_t* a_ptr,
-                                                   const uint8_t* b_ptr, float* c_ptr) {
+    auto future = stream.launch(spert::Grid{1}, [kBlocks](spert::Context* context, const uint8_t* a_ptr,
+                                                          const uint8_t* b_ptr, float* c_ptr) {
         (void) context;
         spacemit_kernels::ime2::gemm_kernel_i8i6k_m1(256, a_ptr, b_ptr, b_ptr, c_ptr, 1, kCols,
                                                      kBlocks, kCols);
@@ -268,7 +267,8 @@ void run_q6_full(spert::Stream& stream) {
         if (diff > worst)
             worst = (float) diff;
     }
-    std::printf("q6full worst_abs_diff=%.3f   col0 kernel=%.2f host=%.2f\n", worst, out[0], host0);
+    std::printf("q6full blocks=%zu worst_abs_diff=%.3f   col0 kernel=%.2f host=%.2f\n", kBlocks, worst,
+                out[0], host0);
 }
 
 /* Which output column consumes which scale lane. Every value is 1 and every scale is
@@ -311,8 +311,8 @@ void run_q6_scale(spert::Stream& stream, const char* name, size_t scale_lane) {
         }
     }
 
-    auto future = stream.launch(spert::Grid{1}, [](spert::Context* context, const uint8_t* a_ptr,
-                                                   const uint8_t* b_ptr, float* c_ptr) {
+    auto future = stream.launch(spert::Grid{1}, [kBlocks](spert::Context* context, const uint8_t* a_ptr,
+                                                          const uint8_t* b_ptr, float* c_ptr) {
         (void) context;
         spacemit_kernels::ime2::gemm_kernel_i8i6k_m1(256, a_ptr, b_ptr, b_ptr, c_ptr, 1, kCols,
                                                      kBlocks, kCols);
@@ -376,7 +376,8 @@ int main() {
     run_q6(stream, "col0 k32 value1", 0, 32, 1);
     run_q6(stream, "col0 k256 value1", 0, 256, 1);
     run_q6(stream, "col3 k300 value5", 3, 300, 5);
-    run_q6_full(stream);
+    run_q6_full(stream, 1);
+    run_q6_full(stream, 8);
     for (size_t lane = 0; lane < 4; lane++) {
         char name[32];
         std::snprintf(name, sizeof(name), "lane%zu", lane);
