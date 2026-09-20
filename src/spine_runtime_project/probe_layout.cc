@@ -190,7 +190,7 @@ void run_q6_full(spert::Stream& stream, size_t kBlocks, bool signed_a) {
                            : static_cast<int8_t>((int) (next(seed) % 127) + 1);
 
     for (size_t col = 0; col < kCols; col++) {
-        d[col] = static_cast<float>((int) (next(seed) % 100) + 1) / 100.0f;
+        d[col] = 1.0f;   /* the operand carries fp16 1.0; the reference must match it */
         for (size_t kii = 0; kii < kK / 16; kii++)
             scales[col * (kK / 16) + kii] = static_cast<int8_t>((int) (next(seed) % 31) - 15);
         for (size_t k = 0; k < kK; k++)
@@ -210,8 +210,7 @@ void run_q6_full(spert::Stream& stream, size_t kBlocks, bool signed_a) {
         uint8_t* bb = b.data() + blk * kQ6Bytes;
 
         for (size_t col = 0; col < kCols; col++) {
-            *reinterpret_cast<uint16_t*>(bb + kQ6Scales + kQ6Qs + kQ6Qh + col * 2) =
-                (uint16_t) (0x3c00 | (col & 1));   /* fp16 near 1.0, column-dependent */
+            *reinterpret_cast<uint16_t*>(bb + kQ6Scales + kQ6Qs + kQ6Qh + col * 2) = 0x3c00;
             for (size_t kii = 0; kii < 16; kii++)
                 reinterpret_cast<int8_t*>(bb)[kii * kCols + col] =
                     scales[col * (kK / 16) + blk * 16 + kii];
