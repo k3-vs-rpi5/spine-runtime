@@ -56,6 +56,20 @@ fi
     -I"$ROOT/src" -I"$SDK/include" -I"$TCM/include" \
     -o "$OUT/a100_bandwidth" "$ROOT/src/spine_runtime_project/a100_bandwidth.cc" \
     -L"$SDK/lib" -lspert -Wl,-rpath,'$ORIGIN' -pthread
+# The layout probe links the vendor kernels themselves (libggml-cpu), so it is only
+# built when that stage exists: it answers a question about the kernels' operand
+# pairing, not about the runtime.
+LLAMA_STAGE_DIR=${SPERT_LLAMA_STAGE:-$WORKSPACE/.local/llama.cpp/stage}
+if [ -f "$LLAMA_STAGE_DIR/bin/libggml-cpu.so" ]; then
+    "$CXX" --sysroot="$TOOLCHAIN/sysroot" -O2 -std=c++17 -Wall $A100_FLAGS \
+        -I"$ROOT/src" -I"$SDK/include" -I"$TCM/include" \
+        -o "$OUT/probe_layout" "$ROOT/src/spine_runtime_project/probe_layout.cc" \
+        -L"$SDK/lib" -lspert -Wl,-rpath,'$ORIGIN' -pthread \
+        -L"$LLAMA_STAGE_DIR/bin" -lggml-cpu -Wl,-rpath-link,"$LLAMA_STAGE_DIR/bin"
+    cp "$OUT/probe_layout" "$STAGE/probe_layout"
+    chmod +x "$STAGE/probe_layout"
+    printf "  %-14s %s bytes\n" probe_layout "$(stat -c%s "$STAGE/probe_layout")"
+fi
 "$CXX" -print-file-name=libstdc++.so.6 >/dev/null
 cp "$OUT/a100_probe" "$STAGE/a100_probe"
 cp "$SDK/lib/libspert.so.1" "$STAGE/libspert.so.1"
