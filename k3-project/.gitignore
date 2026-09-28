@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.venv/
+dist/
+build/
+*.egg-info/
+/results/
+/.local/
+/artifacts/
+/locks/
+/packages/
+/toolchains/
+# Local working checkout of the pinned upstream source; never tracked, it is a
+# clone with its own history and its own build outputs.
+/src/spine-runtime/
